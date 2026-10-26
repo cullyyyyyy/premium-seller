@@ -1,0 +1,26 @@
+# -- Credentials --------------------------------------------
+# NEVER commit -- contains live Tastytrade + email credentials
+config.py
+
+# -- Python ---------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# -- Testing ----------------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
+
+# -- Runtime data -----------------------------------------------
+# Logs, trade records -- kept local, not in source control
+logs/
+bot.lock
+
+# -- Editor / OS ------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
