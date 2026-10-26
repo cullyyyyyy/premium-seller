@@ -29,6 +29,7 @@ from config import (
 )
 from iron_butterfly import build_iron_butterfly, fetch_chain_snapshot, IronButterflyError
 from condor_order_executor import CondorOrderExecutor, CondorPosition, mid_debit_to_close, fetch_leg_quotes
+import fees as _fees
 
 logger = logging.getLogger(__name__)
 et_tz = pytz.timezone("US/Eastern")
@@ -53,15 +54,28 @@ def should_exit(position: CondorPosition, current_debit: Optional[float],
 
 def contracts_for(max_loss_per_share: float, capital: float, max_pct: float, multiplier: int = 100) -> int:
     """Defined-risk sizing: as many contracts as fit within max_pct of
-    capital at the structure's OWN max loss -- not premium paid, unlike
-    spy_0dte_strat's directional strategies."""
+    capital at the structure's OWN max loss, NET of real round-trip
+    fees (fees.py) -- not premium paid, unlike spy_0dte_strat's
+    directional strategies, and not gross-only (closed 2026-10-26,
+    user: "yes close gap" -- the sizing side of the same fee-netting
+    fix the gain/loss targets already got).
+
+    Fees depend on contracts (the $10/leg commission cap, plus linear
+    clearing/regulatory), so there's no closed-form N -- this starts
+    from the gross-only estimate (a safe upper bound: fees only ever
+    make the real per-contract cost >= the gross one) and decrements
+    until the true NET total (gross risk + round_trip_fees(N)) actually
+    fits the budget."""
     if max_loss_per_share <= 0:
         return 0
     budget = capital * max_pct
-    per_contract_risk = max_loss_per_share * multiplier
-    if per_contract_risk <= 0:
+    gross_per_contract_risk = max_loss_per_share * multiplier
+    if gross_per_contract_risk <= 0:
         return 0
-    return max(0, int(budget // per_contract_risk))
+    n = max(0, int(budget // gross_per_contract_risk))
+    while n > 0 and (n * gross_per_contract_risk + _fees.round_trip_fees(n)) > budget:
+        n -= 1
+    return n
 
 
 async def wait_until(hour: int, minute: int, *, _now_fn=None) -> None:

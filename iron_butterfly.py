@@ -26,8 +26,9 @@ reference/debugging, not for any real exit decision. max_loss/
 capital_at_risk stay GROSS (the options-market price side of the
 risk); net_max_loss adds the round-trip fees on top, since losing the
 max still costs you the fees too. Position SIZING (contracts_for, in
-daily_loop.py) is NOT yet fee-aware -- still sizes off GROSS max_loss
-per share -- a known, separate gap from the targets fix this is.
+daily_loop.py) is also fee-aware as of the same day (closed on
+request, "yes close gap") -- it sizes off max_loss per share PLUS the
+real round-trip fees at the resulting contract count, not gross alone.
 """
 import argparse
 import json

@@ -85,6 +85,33 @@ class TestContractsFor:
         n2 = dl.contracts_for(max_loss_per_share=2.40, capital=5000.0, max_pct=0.98)
         assert n2 > n1
 
+    def test_steps_down_when_fees_would_push_a_tight_budget_over(self):
+        """2026-10-26, user: "yes close gap" -- sizing must account for
+        the real round-trip fees at the resulting contract count, not
+        just the gross per-share max_loss. Chosen so the gross-only
+        answer (5 contracts, exactly $980.00 of gross risk, zero
+        headroom) would overshoot the budget once real fees
+        (fees.round_trip_fees(5) ~= $24.82) are added -- the fee-aware
+        answer must step down to 4."""
+        gross_only_n = int((1000.0 * 0.98) // 196.0)
+        assert gross_only_n == 5  # confirms the test setup actually creates zero headroom
+
+        n = dl.contracts_for(max_loss_per_share=1.96, capital=1000.0, max_pct=0.98)
+        assert n == 4
+
+        # And the true total at that size genuinely fits the budget.
+        from fees import round_trip_fees
+        assert n * 1.96 * 100 + round_trip_fees(n) <= 1000.0 * 0.98
+
+    def test_never_sizes_larger_than_the_gross_only_estimate(self):
+        """Fees only ever add cost -- the fee-aware answer must never
+        exceed what gross-only sizing alone would have allowed."""
+        for max_loss, capital in [(1.09, 1000.0), (0.50, 1000.0), (5.00, 10000.0), (0.25, 500.0)]:
+            budget = capital * 0.98
+            gross_only_n = int(budget // (max_loss * 100))
+            n = dl.contracts_for(max_loss_per_share=max_loss, capital=capital, max_pct=0.98)
+            assert n <= gross_only_n
+
 
 class TestWaitUntil:
     def test_returns_immediately_once_target_time_reached(self):
