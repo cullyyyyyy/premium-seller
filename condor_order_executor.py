@@ -389,8 +389,61 @@ class CondorOrderExecutor:
             if status in ("rejected", "cancelled", "expired", "error"):
                 return OrderStatus.REJECTED if status == "rejected" else OrderStatus.ERROR, None, 0
             time.sleep(poll_interval)
-        logger.warning("[ORDER] %s did not fill within %.0fs -- caller should cancel", order_id, timeout_sec)
+        logger.warning("[ORDER] %s did not fill within %.0fs -- cancelling", order_id, timeout_sec)
+        self._cancel_order(order_id)
         return OrderStatus.TIMEOUT, None, 0
+
+    def _cancel_order(self, order_id: str) -> bool:
+        """Cancel an open Day order via DELETE .../orders/{id}, so a
+        timed-out multi-leg order never rests on the book unattended.
+        Ported from spy_0dte_strat's order_executor.py (same retry/401
+        pattern as _post_order/_check_order_once)."""
+        token_refreshed = False
+        retry_count = 0
+        while True:
+            try:
+                response = self._session.delete(
+                    f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/orders/{order_id}",
+                    headers=self.headers, timeout=5,
+                )
+            except Exception as e:
+                if retry_count >= ORDER_POST_MAX_RETRIES:
+                    logger.error("[ORDER] Cancel error for %s after %d retries: %s -- giving up "
+                                 "(order may still be LIVE at the broker)", order_id, retry_count, e)
+                    return False
+                delay = self._backoff_delay(retry_count)
+                time.sleep(delay)
+                retry_count += 1
+                continue
+
+            if response.status_code == 401 and not token_refreshed and self.auth is not None:
+                token_refreshed = True
+                if self.auth.login():
+                    self.session_token = self.auth.session_token
+                    self.headers["Authorization"] = self.session_token
+                    continue
+                logger.error("[ORDER] Token refresh failed -- cancel of %s aborted", order_id)
+                return False
+
+            if response.status_code in (200, 201):
+                logger.info("[ORDER] Cancelled open order %s", order_id)
+                return True
+            if response.status_code in (400, 422):
+                logger.info("[ORDER] Cancel of %s returned %s (already terminal)", order_id, response.status_code)
+                return True
+            if response.status_code == 429 or response.status_code >= 500:
+                if retry_count >= ORDER_POST_MAX_RETRIES:
+                    logger.error("[ORDER] Cancel of %s got %s after %d retries -- giving up "
+                                 "(order may still be LIVE at the broker)",
+                                 order_id, response.status_code, retry_count)
+                    return False
+                delay = self._backoff_delay(retry_count)
+                time.sleep(delay)
+                retry_count += 1
+                continue
+
+            logger.warning("[ORDER] Cancel of %s returned unexpected %s", order_id, response.status_code)
+            return False
 
 
 def mid_debit_to_close(position: CondorPosition, quotes: Dict[str, Tuple[float, float]]) -> float:

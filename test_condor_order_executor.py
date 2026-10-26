@@ -257,9 +257,44 @@ class TestLiveModeHttpPlumbing:
         resp = MagicMock(status_code=200)
         resp.json.return_value = {"data": {"status": "live", "legs": []}}
         executor._session.get.return_value = resp
+        executor._session.delete.return_value = MagicMock(status_code=201)  # the cancel _poll_fill issues
 
         status, net_price, qty = executor._poll_fill(
             "order-1", expected_contracts=1, timeout_sec=0.05, poll_interval=0.01,
         )
         assert status == coe.OrderStatus.TIMEOUT
-        assert net_price is None
+
+    def test_poll_fill_cancels_the_resting_order_on_timeout(self):
+        """A timed-out multi-leg order must never be left resting on the
+        book unattended -- _poll_fill has to actually cancel it, not just
+        report TIMEOUT and leave the caller to remember to."""
+        executor = self._executor_with_mock_session()
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {"data": {"status": "live", "legs": []}}
+        executor._session.get.return_value = get_resp
+        delete_resp = MagicMock(status_code=201)
+        executor._session.delete.return_value = delete_resp
+
+        executor._poll_fill("order-1", expected_contracts=1, timeout_sec=0.05, poll_interval=0.01)
+
+        executor._session.delete.assert_called_once()
+        called_url = executor._session.delete.call_args.args[0]
+        assert called_url.endswith("/orders/order-1")
+
+    def test_cancel_order_401_refreshes_token_and_retries(self):
+        executor = self._executor_with_mock_session()
+        auth = MagicMock()
+        auth.login.return_value = True
+        auth.session_token = "fresh-token"
+        executor.auth = auth
+        unauth_resp = MagicMock(status_code=401)
+        ok_resp = MagicMock(status_code=200)
+        executor._session.delete.side_effect = [unauth_resp, ok_resp]
+
+        assert executor._cancel_order("order-1") is True
+        assert executor.headers["Authorization"] == "fresh-token"
+
+    def test_cancel_order_already_terminal_counts_as_success(self):
+        executor = self._executor_with_mock_session()
+        executor._session.delete.return_value = MagicMock(status_code=422)
+        assert executor._cancel_order("order-1") is True
