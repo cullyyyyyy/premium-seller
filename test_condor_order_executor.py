@@ -110,8 +110,12 @@ class TestPaperModeExit:
         assert math.isclose(order_result.net_price, expected_debit, abs_tol=1e-9)
         assert position.status == "closed"
         assert position.exit_reason == "profit_target"
-        expected_pnl = (position.entry_net_credit - expected_debit) * position.multiplier * position.contracts
-        assert math.isclose(position.realized_pnl, expected_pnl, abs_tol=1e-9)
+        expected_gross_pnl = (position.entry_net_credit - expected_debit) * position.multiplier * position.contracts
+        assert math.isclose(position.gross_pnl, expected_gross_pnl, abs_tol=1e-9)
+        # realized_pnl is NET of the real round-trip fees (2026-10-26: "these
+        # will need to be net") -- not just the options-market price move.
+        assert math.isclose(position.realized_pnl, expected_gross_pnl - position.round_trip_fees, abs_tol=1e-9)
+        assert position.round_trip_fees > 0
 
     def test_paper_exit_never_calls_the_http_session(self):
         result = _sample_result()
@@ -271,8 +275,9 @@ class TestLiveModeExitSignConvention:
         assert math.isclose(order_result.net_price, expected_debit, abs_tol=1e-9)
         assert position.status == "closed"
         assert math.isclose(position.exit_debit, expected_debit, abs_tol=1e-9)
-        expected_pnl = (1.16 - expected_debit) * position.multiplier * position.contracts
-        assert math.isclose(position.realized_pnl, expected_pnl, abs_tol=1e-9)
+        expected_gross_pnl = (1.16 - expected_debit) * position.multiplier * position.contracts
+        assert math.isclose(position.gross_pnl, expected_gross_pnl, abs_tol=1e-9)
+        assert math.isclose(position.realized_pnl, expected_gross_pnl - position.round_trip_fees, abs_tol=1e-9)
 
 
 class TestLiveModeHttpPlumbing:

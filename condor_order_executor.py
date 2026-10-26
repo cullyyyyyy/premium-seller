@@ -100,8 +100,9 @@ class CondorPosition:
     contracts: int
     multiplier: int
     entry_net_credit: float          # per share, AS FILLED (not the planning mid-based figure)
-    max_loss: float                  # per share, from the IronButterflyResult at entry time
-    profit_target_debit: float       # per share, planning figure (net_credit * (1-target_pct))
+    max_loss: float                  # per share, GROSS, from the IronButterflyResult at entry time
+    profit_target_debit: float       # per share, NET of real round-trip fees (fees.py) -- see iron_butterfly.py
+    round_trip_fees: float           # dollars, estimated at entry (fees.py; price-independent, contracts-based)
     entry_time: datetime
     entry_order_id: Optional[str] = None
     status: str = "open"             # "open" | "closed"
@@ -109,7 +110,8 @@ class CondorPosition:
     exit_debit: Optional[float] = None    # per share, AS FILLED
     exit_order_id: Optional[str] = None
     exit_reason: Optional[str] = None     # "profit_target" | "backstop" | "manual" | "error"
-    realized_pnl: Optional[float] = None  # dollars
+    gross_pnl: Optional[float] = None     # dollars, before fees
+    realized_pnl: Optional[float] = None  # dollars, NET of round_trip_fees -- the real economic result
 
     @property
     def legs(self) -> List[CondorLegRecord]:
@@ -171,6 +173,7 @@ def _position_from_result(result: IronButterflyResult, net_credit: float, order_
         entry_net_credit=net_credit,
         max_loss=result.max_loss,
         profit_target_debit=result.profit_target_debit,
+        round_trip_fees=result.round_trip_fees,
         entry_time=datetime.now(),
         entry_order_id=order_id,
     )
@@ -282,7 +285,12 @@ class CondorOrderExecutor:
         position.exit_debit = debit
         position.exit_order_id = order_id
         position.exit_reason = reason
-        position.realized_pnl = (position.entry_net_credit - debit) * position.multiplier * position.contracts
+        position.gross_pnl = (position.entry_net_credit - debit) * position.multiplier * position.contracts
+        # 2026-10-26, user: "We need to account for this ... These will need
+        # to be net" -- the recorded result for a closed trade is the real
+        # economic one (after commission/clearing/regulatory fees), not the
+        # options-market price move alone.
+        position.realized_pnl = position.gross_pnl - position.round_trip_fees
 
     # --- paper-mode fill simulation ----------------------------------------
 

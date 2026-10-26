@@ -143,12 +143,27 @@ class TestBuildIronButterflyEconomics:
         assert math.isclose(r.credit_to_width_call, 5.60 / 6.0, abs_tol=1e-9)
         assert math.isclose(r.credit_to_width_put, 5.60 / 8.0, abs_tol=1e-9)
 
-        # profit_target_debit = 5.60 * (1 - 0.25) = 4.20
-        assert math.isclose(r.profit_target_debit, 4.20, abs_tol=1e-9)
+        # gross_profit_target_debit = 5.60 * (1 - 0.25) = 4.20 (fees ignored)
+        assert math.isclose(r.gross_profit_target_debit, 4.20, abs_tol=1e-9)
 
         # capital_at_risk = max_loss * multiplier * contracts = 2.40*100*1
         assert math.isclose(r.capital_at_risk, 240.0, abs_tol=1e-9)
         assert r.warnings == []
+
+        # Net-of-fees figures (fees.py, contracts=1): entry=4.482, exit=0.482
+        assert math.isclose(r.entry_fees, 4.482, abs_tol=1e-9)
+        assert math.isclose(r.exit_fees, 0.482, abs_tol=1e-9)
+        assert math.isclose(r.round_trip_fees, 4.964, abs_tol=1e-9)
+        # net_max_profit = 560 - 4.964 = 555.036; net_max_loss = 240 + 4.964 = 244.964
+        assert math.isclose(r.net_max_profit, 555.036, abs_tol=1e-9)
+        assert math.isclose(r.net_max_loss, 244.964, abs_tol=1e-9)
+        assert math.isclose(r.net_reward_to_risk, 555.036 / 244.964, abs_tol=1e-9)
+        # profit_target_debit (NET): net_credit - (0.25*555.036 + 4.964)/100
+        assert math.isclose(r.profit_target_debit, 5.60 - (0.25 * 555.036 + 4.964) / 100, abs_tol=1e-9)
+        # The net target is more conservative than the gross one -- it takes
+        # a LOWER debit (more of the credit given back) to actually realize
+        # the same target_pct of profit once real fees are subtracted.
+        assert r.profit_target_debit < r.gross_profit_target_debit
 
     def test_contracts_and_multiplier_scale_capital_at_risk_only(self):
         chain = _base_chain()
@@ -163,9 +178,23 @@ class TestBuildIronButterflyEconomics:
         chain = _base_chain()
         r10 = build_iron_butterfly(chain, target_pct=0.10)
         r50 = build_iron_butterfly(chain, target_pct=0.50)
-        assert math.isclose(r10.profit_target_debit, r10.net_credit * 0.90, abs_tol=1e-9)
-        assert math.isclose(r50.profit_target_debit, r50.net_credit * 0.50, abs_tol=1e-9)
+        assert math.isclose(r10.gross_profit_target_debit, r10.net_credit * 0.90, abs_tol=1e-9)
+        assert math.isclose(r50.gross_profit_target_debit, r50.net_credit * 0.50, abs_tol=1e-9)
         assert r10.net_credit == r50.net_credit
+        # A smaller target_pct means a higher (less aggressive) debit --
+        # true for the net-of-fees figure too, same direction as gross.
+        assert r10.profit_target_debit > r50.profit_target_debit
+
+    def test_more_contracts_means_lower_round_trip_fee_per_share_impact(self):
+        """The $10/leg commission cap means fees grow sub-linearly past
+        10 contracts -- the net profit target should converge toward the
+        gross one as size increases (fees matter less per share)."""
+        chain = _base_chain()
+        r_small = build_iron_butterfly(chain, contracts=1)
+        r_big = build_iron_butterfly(chain, contracts=50)
+        gap_small = r_small.gross_profit_target_debit - r_small.profit_target_debit
+        gap_big = r_big.gross_profit_target_debit - r_big.profit_target_debit
+        assert gap_big < gap_small
 
 
 class TestSanityChecks:

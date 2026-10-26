@@ -12,6 +12,22 @@ Pure selection/economics logic lives here with no network calls, so it
 can be unit-tested against a synthetic chain snapshot. See
 fetch_chain_snapshot() for the one function that touches the live
 OptionsChain (options.py, already ported from spy_0dte_strat).
+
+Fees (2026-10-26, user: "We need to account for this in the premium
+selling strategy especially when considering the gain/loss targets.
+These will need to be net"): every dollar figure on IronButterflyResult
+is labeled GROSS or NET in its own comment. `profit_target_debit` --
+the number should_exit()/daily_loop.py actually compares a live quote
+against -- is NET: it's the debit price that locks in target_pct of
+the structure's max profit AFTER real round-trip commission/clearing/
+regulatory fees (fees.py, verified against real dry-run data the same
+day). `gross_profit_target_debit` is kept alongside it only for
+reference/debugging, not for any real exit decision. max_loss/
+capital_at_risk stay GROSS (the options-market price side of the
+risk); net_max_loss adds the round-trip fees on top, since losing the
+max still costs you the fees too. Position SIZING (contracts_for, in
+daily_loop.py) is NOT yet fee-aware -- still sizes off GROSS max_loss
+per share -- a known, separate gap from the targets fix this is.
 """
 import argparse
 import json
@@ -19,6 +35,8 @@ import logging
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
+
+import fees as _fees
 
 _log = logging.getLogger(__name__)
 
@@ -65,23 +83,30 @@ class IronButterflyResult:
     long_call: LegQuote
     long_put: LegQuote
 
-    net_credit: float            # per share
-    max_profit: float            # per share == net_credit
-    call_side_max_loss: float    # per share
-    put_side_max_loss: float     # per share
-    max_loss: float              # per share == max(call_side, put_side)
+    net_credit: float            # per share, GROSS (no fees)
+    max_profit: float            # per share == net_credit, GROSS
+    call_side_max_loss: float    # per share, GROSS
+    put_side_max_loss: float     # per share, GROSS
+    max_loss: float              # per share == max(call_side, put_side), GROSS
     call_wing_width: float       # per share
     put_wing_width: float        # per share
-    breakeven_lower: float
-    breakeven_upper: float
-    reward_to_risk: float
+    breakeven_lower: float       # GROSS (ignores fees -- the true breakeven is fee-shifted, see net_* below)
+    breakeven_upper: float       # GROSS
+    reward_to_risk: float        # GROSS
     credit_to_width_call: float
     credit_to_width_put: float
     target_pct: float
-    profit_target_debit: float   # per share
+    gross_profit_target_debit: float  # per share -- target_pct of GROSS max profit, no fees (kept for reference)
+    profit_target_debit: float        # per share -- target_pct of NET max profit, fees included (see module docstring)
     contracts: int
     multiplier: int
-    capital_at_risk: float       # dollars = max_loss * multiplier * contracts
+    capital_at_risk: float       # dollars = max_loss * multiplier * contracts (GROSS -- see net_max_loss)
+    entry_fees: float            # dollars, total commission+clearing+regulatory to open at `contracts`
+    exit_fees: float             # dollars, estimated total to close (fees.py's schedule, price-independent)
+    round_trip_fees: float       # dollars == entry_fees + exit_fees
+    net_max_profit: float        # dollars == max_profit*multiplier*contracts - round_trip_fees
+    net_max_loss: float          # dollars == max_loss*multiplier*contracts + round_trip_fees (fees hurt on a loss too)
+    net_reward_to_risk: float    # net_max_profit / net_max_loss -- the economically real ratio
     warnings: List[str]
 
 
@@ -211,8 +236,24 @@ def build_iron_butterfly(
     credit_to_width_call = net_credit / call_wing_width
     credit_to_width_put = net_credit / put_wing_width
 
-    profit_target_debit = net_credit * (1 - target_pct)
+    gross_profit_target_debit = net_credit * (1 - target_pct)
     capital_at_risk = max_loss * multiplier * contracts
+
+    entry_fee_dollars = _fees.entry_fees(contracts)
+    exit_fee_dollars = _fees.exit_fees(contracts)
+    round_trip_fee_dollars = entry_fee_dollars + exit_fee_dollars
+
+    gross_max_profit_dollars = max_profit * multiplier * contracts
+    net_max_profit = gross_max_profit_dollars - round_trip_fee_dollars
+    net_max_loss = capital_at_risk + round_trip_fee_dollars
+    net_reward_to_risk = net_max_profit / net_max_loss if net_max_loss > 0 else 0.0
+
+    # Debit price that locks in target_pct of max profit AFTER fees:
+    # (net_credit - D)*multiplier*contracts - round_trip_fees == target_pct*net_max_profit
+    net_target_profit_dollars = target_pct * net_max_profit
+    profit_target_debit = net_credit - (
+        (net_target_profit_dollars + round_trip_fee_dollars) / (multiplier * contracts)
+    )
 
     return IronButterflyResult(
         short_strike=short_strike, short_call=short_call, short_put=short_put,
@@ -223,8 +264,11 @@ def build_iron_butterfly(
         breakeven_lower=breakeven_lower, breakeven_upper=breakeven_upper,
         reward_to_risk=reward_to_risk,
         credit_to_width_call=credit_to_width_call, credit_to_width_put=credit_to_width_put,
-        target_pct=target_pct, profit_target_debit=profit_target_debit,
+        target_pct=target_pct, gross_profit_target_debit=gross_profit_target_debit,
+        profit_target_debit=profit_target_debit,
         contracts=contracts, multiplier=multiplier, capital_at_risk=capital_at_risk,
+        entry_fees=entry_fee_dollars, exit_fees=exit_fee_dollars, round_trip_fees=round_trip_fee_dollars,
+        net_max_profit=net_max_profit, net_max_loss=net_max_loss, net_reward_to_risk=net_reward_to_risk,
         warnings=warnings,
     )
 
@@ -354,10 +398,16 @@ def format_report(r: IronButterflyResult) -> str:
         f"Put-side max loss:     ${r.put_side_max_loss:.2f}/share",
         f"Max loss (binding):    ${r.max_loss:.2f}/share  (${r.capital_at_risk:.2f} total, {r.contracts} contract(s))",
         f"Breakevens:            ${r.breakeven_lower:.2f} / ${r.breakeven_upper:.2f}",
-        f"Reward:risk:           {r.reward_to_risk:.3f}",
+        f"Reward:risk (gross):   {r.reward_to_risk:.3f}",
         f"Credit:width (call):   {r.credit_to_width_call:.3f}",
         f"Credit:width (put):    {r.credit_to_width_put:.3f}",
-        f"Profit target ({r.target_pct:.0%}): close for a debit of ${r.profit_target_debit:.2f}/share",
+        "",
+        f"Est. round-trip fees:  ${r.round_trip_fees:.2f}  (entry ${r.entry_fees:.2f} + exit ${r.exit_fees:.2f})",
+        f"Net max profit:        ${r.net_max_profit:.2f}  (gross ${r.max_profit * r.multiplier * r.contracts:.2f})",
+        f"Net max loss:          ${r.net_max_loss:.2f}  (gross ${r.capital_at_risk:.2f})",
+        f"Reward:risk (net):     {r.net_reward_to_risk:.3f}",
+        f"Profit target ({r.target_pct:.0%} of NET max profit): close for a debit of ${r.profit_target_debit:.2f}/share "
+        f"(gross-only target would be ${r.gross_profit_target_debit:.2f}/share)",
     ]
     if r.warnings:
         lines.append("")
