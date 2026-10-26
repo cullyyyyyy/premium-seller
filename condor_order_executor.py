@@ -225,11 +225,22 @@ class CondorOrderExecutor:
     # --- exit --------------------------------------------------------------
 
     def submit_exit(self, position: CondorPosition, quotes: Dict[str, Tuple[float, float]],
-                     *, reason: str, dry_run: bool = False) -> OrderResult:
+                     *, reason: str, dry_run: bool = False,
+                     price_override: Optional[float] = None) -> OrderResult:
         """quotes: {symbol: (bid, ask)} for all 4 of position.legs, current
         as of the moment the caller wants to close -- fetched by the
         caller (streamer or REST poll), not by this method, so this
-        module stays testable without a live connection."""
+        module stays testable without a live connection.
+
+        price_override: submit at this debit instead of the mid-based
+        planning figure -- used by daily_loop.py's backstop-retry path
+        to escalate price aggression on a reason="backstop" exit that
+        didn't fill the first time. A hard safety exit that gives up
+        after one unfilled attempt isn't actually a safety exit; see
+        daily_loop.run_day's docstring for the real gap this fixes
+        (found live 2026-10-26: the exit order simply didn't cross at
+        the mid-based price within ORDER_FILL_TIMEOUT_SEC and run_day
+        returned with the position still open)."""
         if not EXECUTE_ORDERS:
             debit = self._simulate_exit_fill(position, quotes)
             self._finalize_exit(position, debit, order_id=None, reason=reason)
@@ -239,7 +250,7 @@ class CondorOrderExecutor:
                                 filled_quantity=position.contracts,
                                 message=f"Paper exit fill ({reason})")
 
-        planning_debit = self._planning_exit_debit(position, quotes)
+        planning_debit = price_override if price_override is not None else self._planning_exit_debit(position, quotes)
         payload = build_exit_payload(position, price=planning_debit)
         order_id = self._post_order(payload, dry_run=dry_run)
         if dry_run:

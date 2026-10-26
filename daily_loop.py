@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 et_tz = pytz.timezone("US/Eastern")
 
 MONITOR_POLL_SEC = 15
+BACKSTOP_PRICE_CONCESSION = 0.05   # added to the planning debit per failed backstop retry
+BACKSTOP_MAX_ATTEMPTS = 10         # bounds how far price escalation can go
 
 
 def should_exit(position: CondorPosition, current_debit: Optional[float],
@@ -119,19 +121,64 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
     )
 
     backstop_time = dt_time(CONDOR_BACKSTOP_HOUR, CONDOR_BACKSTOP_MINUTE)
+    backstop_attempts = 0
+    # Worst-case sane ceiling on how much to pay to close: the debit implied
+    # by the structure's OWN defined max_loss (max_loss = wing_width -
+    # net_credit, so wing_width == net_credit + max_loss) -- never escalate
+    # past what the position could lose anyway by just expiring at the wing.
+    backstop_price_ceiling = position.entry_net_credit + position.max_loss
+
     while True:
         quotes = fetch_leg_quotes(options_chain, position)
         current_debit = mid_debit_to_close(position, quotes) if quotes else None
         now = datetime.now(et_tz)
         reason = should_exit(position, current_debit, now, backstop_time)
-        if reason:
-            exit_result = executor.submit_exit(position, quotes or {}, reason=reason)
-            if position.status == "closed":
-                logger.info(
-                    "[CONDOR] Exited (%s): debit=$%.2f/share, realized P&L=$%.2f",
-                    reason, position.exit_debit, position.realized_pnl,
-                )
-            else:
-                logger.error("[CONDOR] Exit attempt (%s) did not close the position: %s", reason, exit_result.message)
+        if not reason:
+            await asyncio.sleep(MONITOR_POLL_SEC)
+            continue
+
+        price_override = None
+        if reason == "backstop" and backstop_attempts > 0:
+            # A hard safety exit that gives up after one unfilled attempt
+            # isn't actually a safety exit -- found live 2026-10-26 (the
+            # exit didn't cross at the mid-based price within
+            # ORDER_FILL_TIMEOUT_SEC and run_day returned with the position
+            # still open). Escalate price aggression on each retry instead.
+            # `current_debit if ... is not None` (not `or`) -- a real debit
+            # of exactly 0.0 is falsy but legitimate, "or" would wrongly
+            # fall back to the ceiling for it.
+            base_debit = current_debit if current_debit is not None else backstop_price_ceiling
+            concession = min(BACKSTOP_PRICE_CONCESSION * backstop_attempts,
+                              max(0.0, backstop_price_ceiling - base_debit))
+            price_override = base_debit + concession
+
+        exit_result = executor.submit_exit(position, quotes or {}, reason=reason, price_override=price_override)
+
+        if position.status == "closed":
+            logger.info(
+                "[CONDOR] Exited (%s): debit=$%.2f/share, realized P&L=$%.2f",
+                reason, position.exit_debit, position.realized_pnl,
+            )
             return position
-        await asyncio.sleep(MONITOR_POLL_SEC)
+
+        if reason != "backstop":
+            # No urgency to force a profit-target fill -- just keep
+            # monitoring; the next poll recomputes a fresh planning price.
+            logger.warning("[CONDOR] Exit attempt (%s) did not fill: %s -- will retry next poll",
+                            reason, exit_result.message)
+            await asyncio.sleep(MONITOR_POLL_SEC)
+            continue
+
+        backstop_attempts += 1
+        if backstop_attempts >= BACKSTOP_MAX_ATTEMPTS:
+            logger.error(
+                "[CONDOR] Backstop exit FAILED to close after %d attempts (last price_override=$%.2f) -- "
+                "position is still OPEN. No alerting is wired up yet for this (known gap) -- "
+                "manual intervention needed.",
+                backstop_attempts, price_override or 0.0,
+            )
+            return position
+        logger.error("[CONDOR] Backstop exit attempt %d did not fill: %s -- retrying immediately with more aggression",
+                      backstop_attempts, exit_result.message)
+        # No sleep here -- a hard safety exit retries as fast as possible,
+        # not on the normal monitoring cadence.

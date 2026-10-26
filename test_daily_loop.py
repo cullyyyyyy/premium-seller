@@ -174,5 +174,122 @@ class TestRunDay:
         assert position is None
 
 
+class TestRunDayBackstopRetry:
+    """Regression tests for a real gap found live 2026-10-26: run_day
+    used to give up after exactly ONE exit attempt regardless of
+    outcome -- for a "backstop" (the hard safety exit), that defeats
+    its entire purpose. Now it retries with escalating price
+    aggression, bounded by BACKSTOP_MAX_ATTEMPTS and a price ceiling
+    tied to the structure's own defined max_loss."""
+
+    def _setup(self):
+        chain = _base_chain()
+        result = build_iron_butterfly(chain, contracts=1)
+        quotes = {leg.symbol: (0.10, 0.15) for leg in
+                  [result.short_call, result.short_put, result.long_call, result.long_put]}
+        options_chain = MagicMock()
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        return chain, options_chain, executor, quotes
+
+    def _run(self, options_chain, executor, chain, quotes):
+        with patch("daily_loop.wait_until", new=_instant_wait), \
+             patch("daily_loop.fetch_chain_snapshot", return_value=chain), \
+             patch("daily_loop.fetch_leg_quotes", return_value=quotes), \
+             patch("daily_loop.should_exit", return_value="backstop"), \
+             patch("daily_loop.asyncio.sleep", new=_fast_sleep), \
+             patch.object(coe, "EXECUTE_ORDERS", False):
+            return asyncio.run(dl.run_day(options_chain, executor))
+
+    def test_retries_with_escalating_price_until_filled(self):
+        chain, options_chain, executor, quotes = self._setup()
+        seen_overrides = []
+
+        def fake_submit_exit(position, quotes_arg, *, reason, dry_run=False, price_override=None):
+            seen_overrides.append(price_override)
+            if len(seen_overrides) < 3:
+                return coe.OrderResult(status=coe.OrderStatus.TIMEOUT, message="didn't fill")
+            position.status = "closed"
+            position.exit_reason, position.exit_debit, position.realized_pnl = reason, 1.0, 10.0
+            return coe.OrderResult(status=coe.OrderStatus.FILLED, net_price=1.0, filled_quantity=position.contracts)
+
+        executor.submit_exit = MagicMock(side_effect=fake_submit_exit)
+        position = self._run(options_chain, executor, chain, quotes)
+
+        assert position.status == "closed"
+        assert len(seen_overrides) == 3
+        assert seen_overrides[0] is None          # first attempt: planning price, no override
+        assert seen_overrides[1] is not None
+        assert seen_overrides[2] > seen_overrides[1]   # escalating
+
+    def test_gives_up_after_max_attempts_leaves_position_open_not_hidden(self):
+        chain, options_chain, executor, quotes = self._setup()
+        executor.submit_exit = MagicMock(
+            return_value=coe.OrderResult(status=coe.OrderStatus.TIMEOUT, message="never fills"))
+
+        position = self._run(options_chain, executor, chain, quotes)
+
+        assert position is not None
+        assert position.status == "open"  # never silently marked closed
+        assert executor.submit_exit.call_count == dl.BACKSTOP_MAX_ATTEMPTS
+
+    def test_price_never_escalates_past_the_structural_ceiling(self):
+        chain, options_chain, executor, quotes = self._setup()
+        seen_overrides = []
+
+        def fake_submit_exit(position, q, *, reason, dry_run=False, price_override=None):
+            seen_overrides.append(price_override)
+            return coe.OrderResult(status=coe.OrderStatus.TIMEOUT, message="never fills")
+
+        executor.submit_exit = MagicMock(side_effect=fake_submit_exit)
+        self._run(options_chain, executor, chain, quotes)
+
+        # Ceiling = entry_net_credit + max_loss (the debit implied by the
+        # structure's own defined max_loss) -- recomputed independently
+        # from the same fixture to check run_day's escalation against it.
+        result = build_iron_butterfly(chain, contracts=1)
+        from condor_order_executor import _position_from_result
+        pos = _position_from_result(result, result.net_credit, order_id=None)
+        ceiling = pos.entry_net_credit + pos.max_loss
+        for override in seen_overrides:
+            if override is not None:
+                assert override <= ceiling + 1e-9
+
+
+class TestRunDayProfitTargetRetry:
+    def test_profit_target_failure_keeps_polling_without_escalating_price(self):
+        """Unlike backstop, a profit-target exit that doesn't fill isn't
+        urgent -- run_day should keep monitoring (never pass a
+        price_override for this reason) rather than chasing a worse
+        price just to force a fill."""
+        chain = _base_chain()
+        result = build_iron_butterfly(chain, contracts=1)
+        quotes = {leg.symbol: (0.10, 0.15) for leg in
+                  [result.short_call, result.short_put, result.long_call, result.long_put]}
+        options_chain = MagicMock()
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        seen_overrides = []
+
+        def fake_submit_exit(position, quotes_arg, *, reason, dry_run=False, price_override=None):
+            seen_overrides.append(price_override)
+            if len(seen_overrides) < 2:
+                return coe.OrderResult(status=coe.OrderStatus.TIMEOUT, message="didn't fill")
+            position.status = "closed"
+            position.exit_reason, position.exit_debit, position.realized_pnl = reason, 1.0, 10.0
+            return coe.OrderResult(status=coe.OrderStatus.FILLED, net_price=1.0, filled_quantity=position.contracts)
+
+        executor.submit_exit = MagicMock(side_effect=fake_submit_exit)
+
+        with patch("daily_loop.wait_until", new=_instant_wait), \
+             patch("daily_loop.fetch_chain_snapshot", return_value=chain), \
+             patch("daily_loop.fetch_leg_quotes", return_value=quotes), \
+             patch("daily_loop.should_exit", return_value="profit_target"), \
+             patch("daily_loop.asyncio.sleep", new=_fast_sleep), \
+             patch.object(coe, "EXECUTE_ORDERS", False):
+            position = asyncio.run(dl.run_day(options_chain, executor))
+
+        assert position.status == "closed"
+        assert all(o is None for o in seen_overrides)
+
+
 async def _instant_wait(*args, **kwargs):
     return None

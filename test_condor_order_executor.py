@@ -183,6 +183,51 @@ class TestExtractNetFill:
         assert qty == 1
 
 
+class TestSubmitExitPriceOverride:
+    """price_override lets daily_loop.py's backstop-retry path escalate
+    the submitted price past the mid-based planning figure (see
+    daily_loop.run_day's docstring for the real gap this supports)."""
+
+    def test_price_override_is_used_instead_of_planning_debit(self):
+        result = _sample_result(contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+
+        executor._session = MagicMock()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+
+        quotes = {leg.symbol: (0.05, 0.10) for leg in position.legs}
+        with patch.object(coe, "EXECUTE_ORDERS", True), \
+             patch.object(executor, "_poll_fill", return_value=(coe.OrderStatus.FILLED, 1.0, 1)):
+            executor.submit_exit(position, quotes, reason="backstop", price_override=9.99)
+
+        sent_payload = executor._session.post.call_args.kwargs["json"]
+        assert sent_payload["price"] == 9.99
+
+    def test_no_override_falls_back_to_planning_debit(self):
+        result = _sample_result(contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+
+        executor._session = MagicMock()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+
+        quotes = {leg.symbol: (0.05, 0.10) for leg in position.legs}
+        expected_planning_debit = coe.mid_debit_to_close(position, quotes)
+        with patch.object(coe, "EXECUTE_ORDERS", True), \
+             patch.object(executor, "_poll_fill", return_value=(coe.OrderStatus.FILLED, 1.0, 1)):
+            executor.submit_exit(position, quotes, reason="backstop")
+
+        sent_payload = executor._session.post.call_args.kwargs["json"]
+        assert math.isclose(sent_payload["price"], round(expected_planning_debit, 2), abs_tol=1e-9)
+
+
 class TestLiveModeExitSignConvention:
     """Regression test for a real bug found live 2026-10-26: a genuinely
     filled closing order's raw _extract_net_fill value comes back
