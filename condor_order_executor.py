@@ -281,18 +281,7 @@ class CondorOrderExecutor:
         return total
 
     def _planning_exit_debit(self, position: CondorPosition, quotes: Dict[str, Tuple[float, float]]) -> float:
-        """Mid-based planning price for the live limit order -- same
-        role result.net_credit plays on entry (what you expect to pay,
-        not a simulation of slippage)."""
-        total = 0.0
-        for leg in position.legs:
-            bid, ask = quotes[leg.symbol]
-            mid = (bid + ask) / 2.0
-            if leg.entry_action == "Sell to Open":
-                total += mid
-            else:
-                total -= mid
-        return total
+        return mid_debit_to_close(position, quotes)
 
     # --- HTTP plumbing (ported from spy_0dte_strat's order_executor.py;
     #     generic retry/backoff/401-refresh, not leg-count-specific) -------
@@ -404,6 +393,25 @@ class CondorOrderExecutor:
         return OrderStatus.TIMEOUT, None, 0
 
 
+def mid_debit_to_close(position: CondorPosition, quotes: Dict[str, Tuple[float, float]]) -> float:
+    """Mid-based cost to close right now -- same role result.net_credit
+    plays on entry (the fair-value planning figure, not a slippage
+    simulation). Used both as the live exit order's limit price
+    (CondorOrderExecutor._planning_exit_debit) and, in daily_loop.py,
+    as the monitoring signal for the profit-target exit -- a
+    module-level function so the monitoring loop doesn't need an
+    executor instance just to evaluate it."""
+    total = 0.0
+    for leg in position.legs:
+        bid, ask = quotes[leg.symbol]
+        mid = (bid + ask) / 2.0
+        if leg.entry_action == "Sell to Open":
+            total += mid
+        else:
+            total -= mid
+    return total
+
+
 def _extract_net_fill(order_data: dict) -> Tuple[Optional[float], int]:
     """Net price across every leg (credit positive, debit positive --
     caller already knows which this order was), and the filled quantity
@@ -430,3 +438,21 @@ def _extract_net_fill(order_data: dict) -> Tuple[Optional[float], int]:
         net_total += sign * avg_leg_price
         min_filled_qty = leg_qty if min_filled_qty is None else min(min_filled_qty, leg_qty)
     return round(net_total, 4), (min_filled_qty or 0)
+
+
+def fetch_leg_quotes(options_chain, position: CondorPosition) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Current bid/ask for all 4 of a position's legs, via the same
+    batch-quote REST call options.py's _select_by_delta already uses.
+    Returns None (not a partial dict) if any leg is missing a quote --
+    callers should treat that as "can't evaluate the exit right now,"
+    not as 0/None prices for the missing leg. UNVERIFIED against a
+    real connection, same caveat as iron_butterfly.fetch_chain_snapshot."""
+    symbols = [leg.symbol for leg in position.legs]
+    quotes = options_chain._get_batch_quotes(symbols)
+    result: Dict[str, Tuple[float, float]] = {}
+    for sym in symbols:
+        q = quotes.get(sym)
+        if not q or q.get("bid") is None or q.get("ask") is None:
+            return None
+        result[sym] = (float(q["bid"]), float(q["ask"]))
+    return result

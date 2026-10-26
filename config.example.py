@@ -25,17 +25,22 @@ SYMBOL = "SPY"
 STRIKES_OTM = 1      # fallback only -- unused once target_delta is passed to select_strike
 TARGET_DELTA = 0.50  # fallback default for options.py's select_strike(); condor calls override this
 
-# -- 0DTE Iron Condor spec, locked 2026-10-22 (see spy_0dte_strat project memory
-#    "0DTE Iron Condor Spec" for the full origin/reasoning) --
-CONDOR_SHORT_DELTA = 0.25     # abs(delta) target for both short strikes (call and put)
-CONDOR_WING_WIDTH = 2.0       # $ distance from each short strike to its long wing
-CONDOR_PROFIT_TARGET_PCT = 0.50  # close at this fraction of max credit captured
+# -- 0DTE Iron BUTTERFLY spec, given directly by the user 2026-10-26,
+#    superseding the looser "iron condor" spec from 2026-10-22 (OTM
+#    short strangle + fixed-width wings -- see spy_0dte_strat project
+#    memory "0DTE Iron Condor Spec", now marked superseded). The short
+#    strike here is ATM (nearest the underlying price), NOT delta-
+#    targeted -- only the wings are delta-selected. --
+CONDOR_WING_TARGET_DELTA = 0.10      # |delta| target for both long wings, selected independently
+CONDOR_WING_DELTA_TOLERANCE = 0.03   # abort (or warn, if allow_far_wings) past this distance from target
+CONDOR_PROFIT_TARGET_PCT = 0.25      # close at this fraction of net credit captured (user's default)
 CONDOR_ENTRY_HOUR = 10        # single daily entry time (ET) -- after opening vol settles
 CONDOR_ENTRY_MINUTE = 30
 CONDOR_BACKSTOP_HOUR = 14     # force-close by this time regardless of P&L --
 CONDOR_BACKSTOP_MINUTE = 30   # never ride into the final-hour gamma/pin window
 
-# Capital / position sizing -- sized off CONDOR_WING_WIDTH's defined max loss, not premium paid
+# Capital / position sizing -- sized off the structure's OWN defined max loss
+# (iron_butterfly.py's IronButterflyResult.max_loss), not premium paid
 CAPITAL_PER_SYMBOL = 1000.0
 MAX_TRADE_CAPITAL_PCT = 0.98
 
