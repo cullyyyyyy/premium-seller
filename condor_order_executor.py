@@ -415,6 +415,20 @@ class CondorOrderExecutor:
             time.sleep(poll_interval)
         logger.warning("[ORDER] %s did not fill within %.0fs -- cancelling", order_id, timeout_sec)
         self._cancel_order(order_id)
+        # Real race found live 2026-10-26: the order can genuinely fill in
+        # the gap between the last poll above and the cancel request landing
+        # at the broker -- the cancel then correctly reports "already
+        # terminal" (400/422), but that's ambiguous: terminal-because-filled
+        # looks identical to terminal-because-already-expired from
+        # _cancel_order's return value alone. One more status check settles
+        # it -- do NOT trust TIMEOUT without this. Confirmed concretely: an
+        # 8-contract order reported TIMEOUT here, was treated as "nothing
+        # opened," and was actually sitting filled in the account the whole
+        # time until found and closed manually.
+        final_status, final_net_price, final_filled_qty = self._check_order_once(order_id)
+        if final_status == "filled" and final_net_price is not None:
+            logger.warning("[ORDER] %s actually filled in the cancel race -- NOT a timeout", order_id)
+            return OrderStatus.FILLED, final_net_price, final_filled_qty
         return OrderStatus.TIMEOUT, None, 0
 
     def _cancel_order(self, order_id: str) -> bool:

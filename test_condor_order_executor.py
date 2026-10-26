@@ -409,6 +409,82 @@ class TestLiveModeHttpPlumbing:
         called_url = executor._session.delete.call_args.args[0]
         assert called_url.endswith("/orders/order-1")
 
+    def test_poll_fill_catches_a_fill_that_races_the_cancel(self):
+        """Real race found live 2026-10-26: an order can genuinely fill in
+        the gap between the last poll and the cancel request landing --
+        the cancel then correctly reports "already terminal" (422), which
+        is ambiguous (filled vs. actually expired) from that return value
+        alone. _poll_fill must re-check status after cancelling and return
+        FILLED, not TIMEOUT, when that's what actually happened. Caught
+        live: an 8-contract order was reported TIMEOUT and treated as
+        "nothing opened" while it was genuinely sitting filled in the
+        account the whole time."""
+        executor = self._executor_with_mock_session()
+        live_resp = MagicMock(status_code=200)
+        live_resp.json.return_value = {"data": {"status": "live", "legs": []}}
+        filled_resp = MagicMock(status_code=200)
+        filled_resp.json.return_value = {"data": {
+            "status": "Filled",
+            "legs": [
+                {"action": "Sell to Open", "fills": [{"fill-price": "0.55", "quantity": 8}]},
+                {"action": "Sell to Open", "fills": [{"fill-price": "0.46", "quantity": 8}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.08", "quantity": 8}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.08", "quantity": 8}]},
+            ],
+        }}
+        # "live" for every poll during the loop (however many that ends up
+        # being, real-time-dependent), "filled" only once the cancel has
+        # actually been issued -- a flag, not a fixed-length side_effect
+        # list, so this isn't sensitive to exactly how many polls happen
+        # before the real-time deadline hits.
+        cancel_issued = {"done": False}
+
+        def fake_delete(*a, **k):
+            cancel_issued["done"] = True
+            return MagicMock(status_code=422)  # "already terminal"
+
+        def fake_get(*a, **k):
+            return filled_resp if cancel_issued["done"] else live_resp
+
+        executor._session.delete.side_effect = fake_delete
+        executor._session.get.side_effect = fake_get
+
+        status, net_price, filled_qty = executor._poll_fill(
+            "order-1", expected_contracts=8, timeout_sec=0.02, poll_interval=0.01,
+        )
+
+        assert status == coe.OrderStatus.FILLED
+        assert math.isclose(net_price, (0.55 + 0.46) - (0.08 + 0.08), abs_tol=1e-9)
+        assert filled_qty == 8
+
+    def test_poll_fill_genuinely_times_out_when_cancel_truly_cancels(self):
+        """The counterpart to the race test above: when the order really
+        is still live and the cancel genuinely cancels it (not a race),
+        the post-cancel check must still correctly report TIMEOUT."""
+        executor = self._executor_with_mock_session()
+        live_resp = MagicMock(status_code=200)
+        live_resp.json.return_value = {"data": {"status": "live", "legs": []}}
+        cancelled_resp = MagicMock(status_code=200)
+        cancelled_resp.json.return_value = {"data": {"status": "Cancelled", "legs": []}}
+        cancel_issued = {"done": False}
+
+        def fake_delete(*a, **k):
+            cancel_issued["done"] = True
+            return MagicMock(status_code=201)
+
+        def fake_get(*a, **k):
+            return cancelled_resp if cancel_issued["done"] else live_resp
+
+        executor._session.delete.side_effect = fake_delete
+        executor._session.get.side_effect = fake_get
+
+        status, net_price, filled_qty = executor._poll_fill(
+            "order-1", expected_contracts=1, timeout_sec=0.02, poll_interval=0.01,
+        )
+
+        assert status == coe.OrderStatus.TIMEOUT
+        assert net_price is None
+
     def test_cancel_order_401_refreshes_token_and_retries(self):
         executor = self._executor_with_mock_session()
         auth = MagicMock()
