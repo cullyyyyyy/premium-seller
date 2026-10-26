@@ -280,7 +280,7 @@ def fetch_chain_snapshot(options_chain, symbol: str = "SPY") -> ChainSnapshot:
 
     quotes = options_chain._get_batch_quotes(call_symbols + put_symbols)
 
-    underlying_price = options_chain.get_mid_price(symbol) if hasattr(options_chain, "get_mid_price") else None
+    underlying_price = options_chain.get_equity_mid_price(symbol)
     if underlying_price is None:
         raise IronButterflyError(f"Could not get a current price for {symbol}.")
 

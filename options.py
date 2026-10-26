@@ -658,3 +658,62 @@ class OptionsChain:
 
         logger.warning(f"No valid bid/ask for {option_symbol}")
         return None
+
+    def get_equity_quote(self, symbol: str, _retry: bool = True) -> Optional[Dict]:
+        """Fetch current quote for an UNDERLYING equity (e.g. SPY itself),
+        via /market-data/by-type?equity=<symbol> -- the equity counterpart
+        to get_option_quote's equity-option= param. Added for this
+        project's fetch_chain_snapshot(), which needs the underlying's own
+        current price; get_mid_price/get_option_quote can't provide that,
+        they're option-symbol-only (confirmed against spy_0dte_strat: every
+        real call site there passes an OPTION symbol, never a bare ticker --
+        this project's first version of fetch_chain_snapshot made exactly
+        that mistake, caught before ever hitting the real API)."""
+        self._check_oauth_refresh()
+        try:
+            encoded = urllib.parse.quote(symbol, safe='')
+            url = f"{self.base_url}/market-data/by-type?equity={encoded}"
+            response = requests.get(url, headers=self.headers, timeout=3)
+
+            if self._is_auth_error(response.status_code) and _retry:
+                logger.warning(f"Auth error ({response.status_code}) fetching equity quote, attempting token refresh...")
+                if self._refresh_token():
+                    return self.get_equity_quote(symbol, _retry=False)
+                logger.warning("Token refresh failed, cannot fetch equity quote")
+                return None
+
+            if response.status_code != 200:
+                logger.warning(f"Failed to fetch equity quote: {response.status_code} - {response.text[:200]}")
+                return None
+
+            items = response.json().get("data", {}).get("items", [])
+            return items[0] if items else None
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout fetching equity quote for {symbol}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Network error fetching equity quote: {e}")
+            return None
+
+    def get_equity_mid_price(self, symbol: str) -> Optional[float]:
+        """Mid price for an underlying equity -- same bid/ask/last
+        fallback logic as get_mid_price, built on get_equity_quote."""
+        quote = self.get_equity_quote(symbol)
+        if not quote:
+            logger.warning(f"No equity quote returned for {symbol}")
+            return None
+
+        def _f(val) -> float:
+            try:
+                return float(val) if val else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        bid, ask, last = _f(quote.get("bid")), _f(quote.get("ask")), _f(quote.get("last"))
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        if last > 0:
+            return last
+        logger.warning(f"No valid bid/ask/last for {symbol}")
+        return None
