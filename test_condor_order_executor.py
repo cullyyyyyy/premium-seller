@@ -125,12 +125,16 @@ class TestPaperModeExit:
 
 class TestExtractNetFill:
     def test_computes_signed_net_price_and_min_quantity(self):
+        """fill-price and quantity as JSON STRINGS, key "quantity" (not
+        "filled-quantity") -- the real shape, confirmed against two
+        actually-filled sandbox orders 2026-10-26 (see
+        test_matches_a_real_captured_filled_order_response below)."""
         order_data = {
             "legs": [
-                {"action": "Sell to Open", "fills": [{"fill-price": 3.00, "filled-quantity": 2}]},
-                {"action": "Sell to Open", "fills": [{"fill-price": 2.90, "filled-quantity": 2}]},
-                {"action": "Buy to Open", "fills": [{"fill-price": 0.25, "filled-quantity": 2}]},
-                {"action": "Buy to Open", "fills": [{"fill-price": 0.20, "filled-quantity": 1}]},  # partial
+                {"action": "Sell to Open", "fills": [{"fill-price": "3.00", "quantity": 2}]},
+                {"action": "Sell to Open", "fills": [{"fill-price": "2.90", "quantity": 2}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.25", "quantity": 2}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.20", "quantity": 1}]},  # partial
             ]
         }
         net_price, qty = coe._extract_net_fill(order_data)
@@ -139,12 +143,91 @@ class TestExtractNetFill:
 
     def test_returns_none_when_any_leg_unfilled(self):
         order_data = {"legs": [
-            {"action": "Sell to Open", "fills": [{"fill-price": 3.00, "filled-quantity": 1}]},
+            {"action": "Sell to Open", "fills": [{"fill-price": "3.00", "quantity": 1}]},
             {"action": "Sell to Open", "fills": []},
         ]}
         net_price, qty = coe._extract_net_fill(order_data)
         assert net_price is None
         assert qty == 0
+
+    def test_matches_a_real_captured_filled_order_response(self):
+        """Pinned from an actual filled sandbox order (id 2018359,
+        2026-10-26): sell call $0.55 + sell put $0.76 - (buy call $0.07
+        + buy put $0.08) = 1.16 net credit. This is the exact shape
+        GET /accounts/{acct}/orders/{id} returned for a real filled
+        4-leg order -- catches any future regression on the string/int
+        casting or the "quantity" key name."""
+        order_data = {
+            "id": 2018359, "status": "Filled",
+            "legs": [
+                {"action": "Sell to Open", "instrument-type": "Equity Option", "quantity": 1,
+                 "remaining-quantity": 0, "symbol": "SPY   261026C00766000",
+                 "fills": [{"destination-venue": "MARKET_SIMULATOR_A", "fill-id": "33116",
+                            "fill-price": "0.55", "filled-at": "2026-10-26T18:00:42.990+00:00", "quantity": 1}]},
+                {"action": "Sell to Open", "instrument-type": "Equity Option", "quantity": 1,
+                 "remaining-quantity": 0, "symbol": "SPY   261026P00766000",
+                 "fills": [{"destination-venue": "MARKET_SIMULATOR_A", "fill-id": "33117",
+                            "fill-price": "0.76", "filled-at": "2026-10-26T18:00:42.990+00:00", "quantity": 1}]},
+                {"action": "Buy to Open", "instrument-type": "Equity Option", "quantity": 1,
+                 "remaining-quantity": 0, "symbol": "SPY   261026C00769000",
+                 "fills": [{"destination-venue": "MARKET_SIMULATOR_A", "fill-id": "33118",
+                            "fill-price": "0.07", "filled-at": "2026-10-26T18:00:42.991+00:00", "quantity": 1}]},
+                {"action": "Buy to Open", "instrument-type": "Equity Option", "quantity": 1,
+                 "remaining-quantity": 0, "symbol": "SPY   261026P00763000",
+                 "fills": [{"destination-venue": "MARKET_SIMULATOR_A", "fill-id": "33119",
+                            "fill-price": "0.08", "filled-at": "2026-10-26T18:00:42.992+00:00", "quantity": 1}]},
+            ],
+        }
+        net_price, qty = coe._extract_net_fill(order_data)
+        assert math.isclose(net_price, 1.16, abs_tol=1e-9)
+        assert qty == 1
+
+
+class TestLiveModeExitSignConvention:
+    """Regression test for a real bug found live 2026-10-26: a genuinely
+    filled closing order's raw _extract_net_fill value comes back
+    NEGATIVE (Buy-to-Close/Sell-to-Close is the reverse of Sell-to-Open/
+    Buy-to-Open), but every other debit figure in this module
+    (_simulate_exit_fill, mid_debit_to_close) is a POSITIVE cost-to-
+    close. submit_exit's live path must flip the sign before using it."""
+
+    def test_live_exit_fill_produces_a_positive_debit_and_correct_pnl(self):
+        result = _sample_result(contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+        position.entry_net_credit = 1.16  # pin to the real captured-order figure
+
+        executor._session = MagicMock()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "2018418"}}}
+        executor._session.post.return_value = post_resp
+
+        # Shape matches the real filled CLOSE order captured 2026-10-26:
+        # buy back the shorts (debit), sell the wings (credit) -- raw
+        # extraction is negative (a net debit on this order).
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {"data": {
+            "status": "Filled",
+            "legs": [
+                {"action": "Buy to Close", "fills": [{"fill-price": "0.49", "quantity": 1}]},
+                {"action": "Buy to Close", "fills": [{"fill-price": "0.85", "quantity": 1}]},
+                {"action": "Sell to Close", "fills": [{"fill-price": "0.05", "quantity": 1}]},
+                {"action": "Sell to Close", "fills": [{"fill-price": "0.08", "quantity": 1}]},
+            ],
+        }}
+        executor._session.get.return_value = get_resp
+
+        quotes = {leg.symbol: (0.05, 0.10) for leg in position.legs}  # only used for the planning price
+        with patch.object(coe, "EXECUTE_ORDERS", True):
+            order_result = executor.submit_exit(position, quotes, reason="profit_target")
+
+        expected_debit = (0.49 + 0.85) - (0.05 + 0.08)  # = 1.21, positive
+        assert math.isclose(order_result.net_price, expected_debit, abs_tol=1e-9)
+        assert position.status == "closed"
+        assert math.isclose(position.exit_debit, expected_debit, abs_tol=1e-9)
+        expected_pnl = (1.16 - expected_debit) * position.multiplier * position.contracts
+        assert math.isclose(position.realized_pnl, expected_pnl, abs_tol=1e-9)
 
 
 class TestLiveModeHttpPlumbing:
@@ -234,10 +317,10 @@ class TestLiveModeHttpPlumbing:
         resp.json.return_value = {"data": {
             "status": "Filled",
             "legs": [
-                {"action": "Sell to Open", "fills": [{"fill-price": 3.00, "filled-quantity": 1}]},
-                {"action": "Sell to Open", "fills": [{"fill-price": 2.90, "filled-quantity": 1}]},
-                {"action": "Buy to Open", "fills": [{"fill-price": 0.25, "filled-quantity": 1}]},
-                {"action": "Buy to Open", "fills": [{"fill-price": 0.20, "filled-quantity": 1}]},
+                {"action": "Sell to Open", "fills": [{"fill-price": "3.00", "quantity": 1}]},
+                {"action": "Sell to Open", "fills": [{"fill-price": "2.90", "quantity": 1}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.25", "quantity": 1}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.20", "quantity": 1}]},
             ],
         }}
         executor._session.get.return_value = resp

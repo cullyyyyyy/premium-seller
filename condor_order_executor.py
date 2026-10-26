@@ -247,10 +247,23 @@ class CondorOrderExecutor:
         if order_id is None:
             return OrderResult(status=OrderStatus.ERROR, message="Exit order submission failed")
 
-        status, net_price, filled_qty = self._poll_fill(order_id, position.contracts)
+        status, raw_net_price, filled_qty = self._poll_fill(order_id, position.contracts)
+        # _extract_net_fill's convention is direction-agnostic (Sell actions
+        # positive, Buy actions negative, regardless of Open/Close) -- correct
+        # as "net credit received (+) vs net debit paid (-) on THIS order," and
+        # matches entry_net_credit directly for an entry. For an EXIT, the
+        # actions are reversed (Buy to Close on the shorts, Sell to Close on
+        # the wings), so that same convention comes back NEGATIVE for what
+        # costs you money -- the opposite sign from "debit" everywhere else in
+        # this module (_simulate_exit_fill, _planning_exit_debit/
+        # mid_debit_to_close all return a POSITIVE cost-to-close). Confirmed
+        # against a real filled sandbox close 2026-10-26: raw net_price came
+        # back -1.21 for a real $1.21 debit. Flip it here, once, rather than
+        # changing _extract_net_fill's otherwise-correct generic convention.
+        debit = None if raw_net_price is None else -raw_net_price
         if status == OrderStatus.FILLED:
-            self._finalize_exit(position, net_price, order_id=order_id, reason=reason)
-        return OrderResult(status=status, order_id=order_id, net_price=net_price, filled_quantity=filled_qty)
+            self._finalize_exit(position, debit, order_id=order_id, reason=reason)
+        return OrderResult(status=status, order_id=order_id, net_price=debit, filled_quantity=filled_qty)
 
     def _finalize_exit(self, position: CondorPosition, debit: float, order_id: Optional[str], reason: str) -> None:
         position.status = "closed"
@@ -470,8 +483,19 @@ def _extract_net_fill(order_data: dict) -> Tuple[Optional[float], int]:
     caller already knows which this order was), and the filled quantity
     as the MINIMUM filled across legs (conservative: bounds how many
     complete 4-leg units are actually done if one leg only partially
-    filled). UNVERIFIED against a real multi-leg response -- see this
-    module's docstring."""
+    filled).
+
+    VERIFIED against two real filled sandbox orders, 2026-10-26. The
+    real shape differs from what this function originally assumed in
+    two ways, both fixed here:
+      - each fill's quantity key is "quantity", NOT "filled-quantity"
+        (the key spy_0dte_strat's single-leg _extract_filled_quantity
+        uses -- this function generalized that name without checking
+        it against a real multi-leg response, and it was wrong).
+      - "fill-price" and "quantity" both come back as JSON STRINGS
+        ("0.55", not 0.55) -- multiplying a string by an int doesn't
+        raise, it just does Python's string-repeat, silently producing
+        garbage instead of an error. Both are now cast explicitly."""
     legs = order_data.get("legs") or order_data.get("order-legs") or []
     if not legs:
         return None, 0
@@ -481,10 +505,10 @@ def _extract_net_fill(order_data: dict) -> Tuple[Optional[float], int]:
         fills = leg.get("fills", [])
         if not fills:
             return None, 0
-        leg_qty = sum(f.get("filled-quantity", 0) for f in fills)
+        leg_qty = sum(int(f.get("quantity") or 0) for f in fills)
         if leg_qty <= 0:
             return None, 0
-        leg_value = sum(f.get("fill-price", 0) * f.get("filled-quantity", 0) for f in fills)
+        leg_value = sum(float(f.get("fill-price") or 0) * int(f.get("quantity") or 0) for f in fills)
         avg_leg_price = leg_value / leg_qty
         action = leg.get("action", "")
         sign = 1 if action.startswith("Sell") else -1
