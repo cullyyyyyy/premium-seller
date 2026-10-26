@@ -13,7 +13,12 @@ today did, cleaned up into one place:
   2. Set EXECUTE_ORDERS=True for this process only -- config.py on
      disk stays False, this script is the one place that flips it.
   3. Run daily_loop.run_day() for real.
-  4. Any unhandled exception is caught at the top level and sent as a
+  4. If a position closed, run daily_loop.track_post_close() through
+     market close -- hindsight-only pricing, logged to
+     logs/post_close_eval_<date>.jsonl, never feeds back into any
+     decision. Added 2026-10-27 on request ("check pricing after 2:30
+     cutoff to evaluate P/L in the future").
+  5. Any unhandled exception is caught at the top level and sent as a
      CRITICAL alert (alerts.notify_crash) before re-raising -- there's
      still no crash-recovery mechanism (a crash mid-day still leaves
      whatever position was open unmanaged), but a crash is no longer
@@ -80,6 +85,11 @@ async def _main() -> int:
         "Day complete: status=%s reason=%s exit_debit=%s realized_pnl=%s",
         position.status, position.exit_reason, position.exit_debit, position.realized_pnl,
     )
+
+    if position.status == "closed":
+        log.info("Tracking post-close pricing through market close for hindsight evaluation...")
+        records = await dl.track_post_close(chain_api, position)
+        log.info("Post-close tracking: %d records written.", len(records))
     return 0
 
 

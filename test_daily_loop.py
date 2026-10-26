@@ -1,4 +1,6 @@
 import asyncio
+import json
+import math
 from datetime import datetime, time as dt_time
 from unittest.mock import MagicMock, patch
 
@@ -342,3 +344,109 @@ class TestRunDayProfitTargetRetry:
 
 async def _instant_wait(*args, **kwargs):
     return None
+
+
+class TestHypotheticalNetPnl:
+    def _closed_position(self):
+        chain = _base_chain()
+        result = build_iron_butterfly(chain, contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+            quotes = {leg.symbol: (0.05, 0.10) for leg in position.legs}
+            executor.submit_exit(position, quotes, reason="profit_target")
+        return position
+
+    def test_matches_gross_minus_fees_formula(self):
+        position = self._closed_position()
+        quotes = {leg.symbol: (0.20, 0.25) for leg in position.legs}
+        hypo = dl.hypothetical_net_pnl(position, quotes)
+        debit = coe.mid_debit_to_close(position, quotes)
+        expected = ((position.entry_net_credit - debit) * position.multiplier * position.contracts
+                    - position.round_trip_fees)
+        assert math.isclose(hypo, expected, abs_tol=1e-9)
+
+    def test_does_not_mutate_the_position(self):
+        """Pure hindsight calculation -- must never touch the real,
+        already-recorded realized_pnl."""
+        position = self._closed_position()
+        original_realized = position.realized_pnl
+        quotes = {leg.symbol: (0.01, 0.02) for leg in position.legs}
+        dl.hypothetical_net_pnl(position, quotes)
+        assert position.realized_pnl == original_realized
+
+
+class TestTrackPostClose:
+    """2026-10-27, user: "check pricing after 2:30 cutoff to evaluate
+    P/L in the future" -- track what an already-closed position would
+    have been worth had it stayed open, through market close."""
+
+    def _closed_position(self):
+        chain = _base_chain()
+        result = build_iron_butterfly(chain, contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+            quotes = {leg.symbol: (0.05, 0.10) for leg in position.legs}
+            executor.submit_exit(position, quotes, reason="profit_target")
+        return position
+
+    def test_noop_if_position_is_not_actually_closed(self):
+        chain = _base_chain()
+        result = build_iron_butterfly(chain, contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)  # still open, never exited
+
+        options_chain = MagicMock()
+        records = asyncio.run(dl.track_post_close(options_chain, position, _now_fn=lambda: _dt(14, 35)))
+        assert records == []
+
+    def test_records_until_market_close_then_stops(self, tmp_path):
+        position = self._closed_position()
+        options_chain = MagicMock()
+        options_chain.get_equity_mid_price.return_value = 765.00
+        quotes = {leg.symbol: (0.10, 0.15) for leg in position.legs}
+
+        times = iter([_dt(15, 58), _dt(15, 59), _dt(16, 0)])  # two polls, then 16:00 stops the loop
+
+        def now_fn():
+            return next(times, _dt(16, 1))  # safety net, can't hang if logic is wrong
+
+        log_file = tmp_path / "post_close.jsonl"
+        with patch("daily_loop.fetch_leg_quotes", return_value=quotes), \
+             patch("daily_loop.asyncio.sleep", new=_fast_sleep):
+            records = asyncio.run(dl.track_post_close(
+                options_chain, position, until_hour=16, until_minute=0,
+                log_path=log_file, _now_fn=now_fn,
+            ))
+
+        assert len(records) == 2
+        assert records[0]["spy_price"] == 765.00
+        assert "hypothetical_net_pnl_if_held" in records[0]
+        assert records[0]["actual_realized_pnl"] == position.realized_pnl
+        assert records[0]["actual_exit_reason"] == "profit_target"
+
+        lines = log_file.read_text().strip().split("\n")
+        assert len(lines) == 2
+        assert json.loads(lines[0])["timestamp"] == records[0]["timestamp"]
+
+    def test_skips_a_poll_with_no_quotes_but_keeps_going(self, tmp_path):
+        position = self._closed_position()
+        options_chain = MagicMock()
+        options_chain.get_equity_mid_price.return_value = 765.0
+        ok_quotes = {leg.symbol: (0.10, 0.15) for leg in position.legs}
+
+        times = iter([_dt(15, 58), _dt(15, 59), _dt(16, 0)])
+
+        def now_fn():
+            return next(times, _dt(16, 1))
+
+        with patch("daily_loop.fetch_leg_quotes", side_effect=[None, ok_quotes]), \
+             patch("daily_loop.asyncio.sleep", new=_fast_sleep):
+            records = asyncio.run(dl.track_post_close(
+                options_chain, position, until_hour=16, until_minute=0,
+                log_path=tmp_path / "x.jsonl", _now_fn=now_fn,
+            ))
+
+        assert len(records) == 1  # first poll had no quotes (skipped), second recorded

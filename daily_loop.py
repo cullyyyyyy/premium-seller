@@ -23,9 +23,11 @@ for the top-level try/except that at least turns a crash into one
 alert, which is the closest thing to a mitigation that exists yet.
 """
 import asyncio
+import json
 import logging
 from datetime import datetime, time as dt_time
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 import pytz
 
@@ -34,6 +36,7 @@ from config import (
     CONDOR_BACKSTOP_HOUR, CONDOR_BACKSTOP_MINUTE,
     CONDOR_WING_TARGET_DELTA, CONDOR_WING_DELTA_TOLERANCE, CONDOR_PROFIT_TARGET_PCT,
     CAPITAL_PER_SYMBOL, MAX_TRADE_CAPITAL_PCT, SYMBOL,
+    MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
 )
 from iron_butterfly import build_iron_butterfly, fetch_chain_snapshot, IronButterflyError
 from condor_order_executor import CondorOrderExecutor, CondorPosition, mid_debit_to_close, fetch_leg_quotes
@@ -46,6 +49,9 @@ et_tz = pytz.timezone("US/Eastern")
 MONITOR_POLL_SEC = 15
 BACKSTOP_PRICE_CONCESSION = 0.05   # added to the planning debit per failed backstop retry
 BACKSTOP_MAX_ATTEMPTS = 10         # bounds how far price escalation can go
+POST_CLOSE_TRACK_POLL_SEC = 60     # coarser cadence -- this is for hindsight analysis, not trading
+
+LOG_DIR = Path(__file__).parent / "logs"
 
 
 def should_exit(position: CondorPosition, current_debit: Optional[float],
@@ -212,3 +218,79 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
                       backstop_attempts, exit_result.message)
         # No sleep here -- a hard safety exit retries as fast as possible,
         # not on the normal monitoring cadence.
+
+
+def hypothetical_net_pnl(position: CondorPosition, quotes) -> float:
+    """What the net P&L WOULD be right now if this (already-closed)
+    position were still open and closed at these quotes -- pure
+    hindsight data. Never mutates the position; position.realized_pnl
+    stays the one real, already-recorded result."""
+    debit = mid_debit_to_close(position, quotes)
+    gross = (position.entry_net_credit - debit) * position.multiplier * position.contracts
+    return gross - position.round_trip_fees
+
+
+async def track_post_close(
+    options_chain, position: CondorPosition, symbol: str = SYMBOL,
+    *,
+    until_hour: int = MARKET_CLOSE_HOUR, until_minute: int = MARKET_CLOSE_MINUTE,
+    poll_sec: float = POST_CLOSE_TRACK_POLL_SEC,
+    log_path: Optional[Path] = None,
+    _now_fn=None,
+) -> List[dict]:
+    """After a position closes (profit target or backstop), keep
+    recording what it WOULD have been worth had it stayed open, through
+    the rest of the trading day -- pure hindsight evaluation, never
+    feeds back into any live decision (should_exit/submit_exit are
+    never called here). Built 2026-10-27 on request ("check pricing
+    after 2:30 cutoff to evaluate P/L in the future").
+
+    Appends one JSON line per poll to log_path (default:
+    logs/post_close_eval_<today>.jsonl) and also returns the same
+    records in memory, so this is testable without touching the
+    filesystem (pass log_path=None and a tmp_path in tests, or just
+    inspect the return value).
+
+    No-op (returns []) if the position isn't actually closed yet --
+    this is explicitly post-close tracking, not a replacement for the
+    real monitoring loop in run_day()."""
+    if position.status != "closed":
+        logger.warning(
+            "[CONDOR] track_post_close called on a position that isn't closed (status=%s) -- skipping.",
+            position.status,
+        )
+        return []
+
+    now_fn = _now_fn or (lambda: datetime.now(et_tz))
+    until_time = dt_time(until_hour, until_minute)
+
+    if log_path is None:
+        LOG_DIR.mkdir(exist_ok=True)
+        log_path = LOG_DIR / f"post_close_eval_{now_fn().strftime('%Y-%m-%d')}.jsonl"
+
+    records: List[dict] = []
+    while True:
+        now = now_fn()
+        if now.time() >= until_time:
+            break
+        quotes = fetch_leg_quotes(options_chain, position)
+        if quotes is not None:
+            spy_price = options_chain.get_equity_mid_price(symbol)
+            record = {
+                "timestamp": now.isoformat(),
+                "spy_price": spy_price,
+                "hypothetical_debit_to_close": mid_debit_to_close(position, quotes),
+                "hypothetical_net_pnl_if_held": hypothetical_net_pnl(position, quotes),
+                "actual_realized_pnl": position.realized_pnl,
+                "actual_exit_reason": position.exit_reason,
+                "actual_exit_time": position.exit_time.isoformat() if position.exit_time else None,
+            }
+            records.append(record)
+            with open(log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        else:
+            logger.warning("[CONDOR] track_post_close: no quotes available at %s -- skipping this poll", now)
+        await asyncio.sleep(poll_sec)
+
+    logger.info("[CONDOR] Post-close tracking finished (%d records) -> %s", len(records), log_path)
+    return records
