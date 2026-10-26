@@ -34,8 +34,9 @@ TARGET_DELTA = 0.50  # fallback default for options.py's select_strike(); condor
 CONDOR_WING_TARGET_DELTA = 0.10      # |delta| target for both long wings, selected independently
 CONDOR_WING_DELTA_TOLERANCE = 0.03   # abort (or warn, if allow_far_wings) past this distance from target
 CONDOR_PROFIT_TARGET_PCT = 0.25      # close at this fraction of net credit captured (user's default)
-CONDOR_ENTRY_HOUR = 10        # single daily entry time (ET) -- after opening vol settles
-CONDOR_ENTRY_MINUTE = 30
+CONDOR_ENTRY_HOUR = 10        # single daily entry time (ET), user-set 2026-10-27 --
+CONDOR_ENTRY_MINUTE = 0       # matches tastylive's own 0DTE iron fly research
+                              # (10:00-10:30am ET window tested best, see project memory)
 CONDOR_BACKSTOP_HOUR = 14     # force-close by this time regardless of P&L --
 CONDOR_BACKSTOP_MINUTE = 30   # never ride into the final-hour gamma/pin window
 
