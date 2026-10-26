@@ -247,13 +247,49 @@ def chain_snapshot_from_dict(data: dict) -> ChainSnapshot:
     )
 
 
+CHAIN_WINDOW_POINTS = 40   # only quote strikes within this many $ of the underlying
+QUOTE_CHUNK_SIZE = 50      # symbols per batch-quote REST call
+
+
+def _chunked_batch_quotes(options_chain, symbols: list) -> dict:
+    """options_chain._get_batch_quotes puts every symbol into ONE query
+    string -- fine for the ~14-strike window _select_by_delta uses, but
+    a real 0DTE chain has 100+ strikes per side and blows past the
+    server's URL length limit (confirmed live 2026-10-26: a ~300-symbol
+    request got a real 414 Request-URI Too Large from the sandbox's
+    nginx). Chunk it instead of trusting any one request to fit."""
+    merged: dict = {}
+    for i in range(0, len(symbols), QUOTE_CHUNK_SIZE):
+        chunk = symbols[i:i + QUOTE_CHUNK_SIZE]
+        merged.update(options_chain._get_batch_quotes(chunk))
+    return merged
+
+
 def fetch_chain_snapshot(options_chain, symbol: str = "SPY") -> ChainSnapshot:
     """Build a ChainSnapshot from the live OptionsChain (options.py),
-    fetching bid/ask/delta for every strike in today's 0DTE expiration
-    via the same batch-quote REST call _select_by_delta already uses.
-    Not yet exercised against a real connection in this session --
-    build_iron_butterfly itself is fully tested against synthetic data
-    (test_iron_butterfly.py); this is the thin live-data adapter."""
+    fetching bid/ask/delta for strikes within CHAIN_WINDOW_POINTS of the
+    underlying price in today's 0DTE expiration, chunked across several
+    batch-quote REST calls (see _chunked_batch_quotes).
+
+    IMPORTANT, confirmed live 2026-10-26: the SANDBOX (cert) environment
+    has no real market-data feed at all -- both the equity-quote and
+    option batch-quote endpoints returned plain 502s from sandbox, while
+    the chain STRUCTURE endpoint (strikes/symbols, no prices) works fine
+    there. This mirrors spy_0dte_strat's own live_runner.py, which always
+    builds its OptionsChain against PRODUCTION via OAuth
+    (create_production_options_chain()) for real chain/quote data, and
+    only uses a sandbox session for actual order submission. Callers of
+    this function MUST pass an OptionsChain built the same way -- a
+    sandbox-session OptionsChain will fail here with "no current price."
+    """
+    underlying_price = options_chain.get_equity_mid_price(symbol)
+    if underlying_price is None:
+        raise IronButterflyError(
+            f"Could not get a current price for {symbol} -- if this OptionsChain "
+            f"is on a sandbox session, it has no real market data; build it against "
+            f"production instead (see this function's docstring)."
+        )
+
     exp_data = options_chain.get_0dte_strikes(symbol)
     if not exp_data:
         raise IronButterflyError(f"Could not fetch a 0DTE chain for {symbol}.")
@@ -269,6 +305,8 @@ def fetch_chain_snapshot(options_chain, symbol: str = "SPY") -> ChainSnapshot:
     by_call_sym, by_put_sym = {}, {}
     for s in strikes:
         px = strike_price(s)
+        if abs(px - underlying_price) > CHAIN_WINDOW_POINTS:
+            continue
         call_sym = s.get("call") or s.get("call-streamer-symbol")
         put_sym = s.get("put") or s.get("put-streamer-symbol")
         if call_sym:
@@ -278,11 +316,7 @@ def fetch_chain_snapshot(options_chain, symbol: str = "SPY") -> ChainSnapshot:
             put_symbols.append(put_sym)
             by_put_sym[put_sym] = px
 
-    quotes = options_chain._get_batch_quotes(call_symbols + put_symbols)
-
-    underlying_price = options_chain.get_equity_mid_price(symbol)
-    if underlying_price is None:
-        raise IronButterflyError(f"Could not get a current price for {symbol}.")
+    quotes = _chunked_batch_quotes(options_chain, call_symbols + put_symbols)
 
     def build_legs(symbols, by_sym):
         legs = []
