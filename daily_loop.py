@@ -6,13 +6,21 @@ live quotes for the profit-target exit, force-close at the backstop
 time otherwise.
 
 should_exit() and contracts_for() are the real decision logic and are
-fully unit-tested as pure functions (test_daily_loop.py). run_day()'s
-async orchestration (waiting for wall-clock time, the monitoring poll
-loop) is thin glue code and, like fetch_chain_snapshot() and the live
-order path in condor_order_executor.py, is UNTESTED against a real
-connection -- there is no sandbox account wired into this session to
-exercise it against. Treat it as unverified until it has run once for
-real.
+fully unit-tested as pure functions (test_daily_loop.py). run_day()
+itself HAS been run live against the real sandbox+production APIs
+(2026-10-26/27) -- entry, monitoring, the backstop-retry escalation,
+and a real fee-aware sizing all confirmed working, including catching
+and fixing a real fill-vs-cancel race and a real sign-convention bug
+along the way (see condor_order_executor.py's history).
+
+Alerting (alerts.py) is wired into every real decision point as of
+2026-10-27: entry success/failure, every exit, and critically the
+backstop-exhausted-retries case (previously a silent gap -- a position
+could be left open with nobody told). What's still NOT covered: a
+crash in this process itself (not a failed order, the whole run_day()
+coroutine dying) still has no recovery or alert -- see run_trade_day.py
+for the top-level try/except that at least turns a crash into one
+alert, which is the closest thing to a mitigation that exists yet.
 """
 import asyncio
 import logging
@@ -30,6 +38,7 @@ from config import (
 from iron_butterfly import build_iron_butterfly, fetch_chain_snapshot, IronButterflyError
 from condor_order_executor import CondorOrderExecutor, CondorPosition, mid_debit_to_close, fetch_leg_quotes
 import fees as _fees
+import alerts as _alerts
 
 logger = logging.getLogger(__name__)
 et_tz = pytz.timezone("US/Eastern")
@@ -109,6 +118,7 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
         prelim = _build_sized_result(chain, contracts=1)
     except IronButterflyError as e:
         logger.error("[CONDOR] Could not build a structure today: %s", e)
+        _alerts.notify_no_entry(f"could not build a structure: {e}")
         return None
 
     contracts = contracts_for(prelim.max_loss, CAPITAL_PER_SYMBOL, MAX_TRADE_CAPITAL_PCT)
@@ -117,22 +127,27 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
             "[CONDOR] Sized to 0 contracts (max_loss=$%.2f/share vs capital budget) -- skipping today.",
             prelim.max_loss,
         )
+        _alerts.notify_no_entry(f"sized to 0 contracts (max_loss=${prelim.max_loss:.2f}/share vs budget)")
         return None
 
     try:
         result = _build_sized_result(chain, contracts=contracts)
     except IronButterflyError as e:
         logger.error("[CONDOR] Could not build a structure today at sized contracts: %s", e)
+        _alerts.notify_no_entry(f"could not build at sized contracts: {e}")
         return None
 
     order_result, position = executor.submit_entry(result)
     if position is None:
         logger.error("[CONDOR] Entry failed: %s", order_result.message)
+        _alerts.notify_no_entry(f"entry order did not fill: {order_result.message}")
         return None
     logger.info(
         "[CONDOR] Entered %dx short $%.2f straddle | net credit $%.2f/share | max loss $%.2f/share",
         contracts, result.short_strike, position.entry_net_credit, position.max_loss,
     )
+    _alerts.notify_entry(result.short_strike, contracts, position.entry_net_credit,
+                          position.max_loss * position.multiplier * contracts)
 
     backstop_time = dt_time(CONDOR_BACKSTOP_HOUR, CONDOR_BACKSTOP_MINUTE)
     backstop_attempts = 0
@@ -173,6 +188,7 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
                 "[CONDOR] Exited (%s): debit=$%.2f/share, realized P&L=$%.2f",
                 reason, position.exit_debit, position.realized_pnl,
             )
+            _alerts.notify_exit(reason, position.exit_debit, position.realized_pnl)
             return position
 
         if reason != "backstop":
@@ -187,10 +203,10 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
         if backstop_attempts >= BACKSTOP_MAX_ATTEMPTS:
             logger.error(
                 "[CONDOR] Backstop exit FAILED to close after %d attempts (last price_override=$%.2f) -- "
-                "position is still OPEN. No alerting is wired up yet for this (known gap) -- "
-                "manual intervention needed.",
+                "position is still OPEN -- manual intervention needed.",
                 backstop_attempts, price_override or 0.0,
             )
+            _alerts.notify_backstop_failure(backstop_attempts, price_override or 0.0)
             return position
         logger.error("[CONDOR] Backstop exit attempt %d did not fill: %s -- retrying immediately with more aggression",
                       backstop_attempts, exit_result.message)

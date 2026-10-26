@@ -14,6 +14,18 @@ def _dt(hour, minute, second=0):
     return datetime(2026, 10, 26, hour, minute, second)
 
 
+@pytest.fixture(autouse=True)
+def mock_alerts():
+    """alerts.py fires real (fire-and-forget) HTTP POSTs -- every test in
+    this file goes through run_day() paths that now call it. Patch it out
+    everywhere so the suite stays hermetic and fast, not dependent on a
+    real (and in CI, nonexistent) webhook URL. Yields the mock so tests
+    can assert the right alert actually fired, not just that nothing
+    crashed."""
+    with patch("daily_loop._alerts", MagicMock()) as m:
+        yield m
+
+
 class TestShouldExit:
     def _position(self, profit_target_debit=4.20):
         chain = _base_chain()
@@ -158,7 +170,7 @@ class TestRunDay:
         ]
         return options_chain, patches
 
-    def test_full_day_exits_on_profit_target(self):
+    def test_full_day_exits_on_profit_target(self, mock_alerts):
         chain = _base_chain()
         result = build_iron_butterfly(chain, contracts=1)
         # Quotes sequence: first poll still expensive to close, second poll hits target.
@@ -185,8 +197,11 @@ class TestRunDay:
         assert position is not None
         assert position.status == "closed"
         assert position.exit_reason == "profit_target"
+        mock_alerts.notify_entry.assert_called_once()
+        mock_alerts.notify_exit.assert_called_once()
+        mock_alerts.notify_backstop_failure.assert_not_called()
 
-    def test_zero_sized_contracts_skips_entry(self):
+    def test_zero_sized_contracts_skips_entry(self, mock_alerts):
         chain = _base_chain()
         options_chain, patches = self._mock_options_chain_and_patches(chain, quotes_sequence=[])
         executor = coe.CondorOrderExecutor(session_token="tok")
@@ -199,6 +214,7 @@ class TestRunDay:
 
         position = asyncio.run(run())
         assert position is None
+        mock_alerts.notify_no_entry.assert_called_once()
 
 
 class TestRunDayBackstopRetry:
@@ -248,7 +264,7 @@ class TestRunDayBackstopRetry:
         assert seen_overrides[1] is not None
         assert seen_overrides[2] > seen_overrides[1]   # escalating
 
-    def test_gives_up_after_max_attempts_leaves_position_open_not_hidden(self):
+    def test_gives_up_after_max_attempts_leaves_position_open_not_hidden(self, mock_alerts):
         chain, options_chain, executor, quotes = self._setup()
         executor.submit_exit = MagicMock(
             return_value=coe.OrderResult(status=coe.OrderStatus.TIMEOUT, message="never fills"))
@@ -258,6 +274,12 @@ class TestRunDayBackstopRetry:
         assert position is not None
         assert position.status == "open"  # never silently marked closed
         assert executor.submit_exit.call_count == dl.BACKSTOP_MAX_ATTEMPTS
+        # The exact gap this session closed: a position left open after
+        # exhausting retries must trigger the critical alert, not just a
+        # log line nobody's watching.
+        mock_alerts.notify_backstop_failure.assert_called_once()
+        call_args = mock_alerts.notify_backstop_failure.call_args.args
+        assert call_args[0] == dl.BACKSTOP_MAX_ATTEMPTS
 
     def test_price_never_escalates_past_the_structural_ceiling(self):
         chain, options_chain, executor, quotes = self._setup()
