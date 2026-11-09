@@ -36,6 +36,25 @@ class TestNotifyHelpers:
             alerts.notify_exit(reason="backstop", exit_debit=1.00, realized_pnl=-924.46)
         assert "-924.46" in mock_post.call_args.args[0]
 
+    def test_notify_exit_omits_pct_without_net_credit(self):
+        with patch("alerts._post") as mock_post:
+            alerts.notify_exit(reason="profit_target", exit_debit=0.68, realized_pnl=143.88)
+        assert "%" not in mock_post.call_args.args[0]
+
+    def test_notify_exit_includes_pct_of_net_credit(self):
+        """137.04 realized P&L against 548.00 net credit collected =
+        25.0%, not the capital_at_risk-basis figure this used to report
+        (user correction 2026-11-06)."""
+        with patch("alerts._post") as mock_post:
+            alerts.notify_exit(reason="profit_target", exit_debit=4.06, realized_pnl=137.04, net_credit=548.0)
+        text = mock_post.call_args.args[0]
+        assert "(+25.0%)" in text
+
+        with patch("alerts._post") as mock_post:
+            alerts.notify_exit(reason="backstop", exit_debit=5.68, realized_pnl=-845.89, net_credit=927.0)
+        text = mock_post.call_args.args[0]
+        assert "(-91.3%)" in text
+
     def test_notify_backstop_failure_marks_critical(self):
         with patch("alerts._post") as mock_post:
             alerts.notify_backstop_failure(attempts=10, last_price_override=1.95)

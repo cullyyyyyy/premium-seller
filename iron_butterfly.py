@@ -33,6 +33,7 @@ real round-trip fees at the resulting contract count, not gross alone.
 import argparse
 import json
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
@@ -117,6 +118,40 @@ def _distance_to_half(delta_call: float, delta_put: float) -> float:
     return abs(delta_call - 0.50) + abs(abs(delta_put) - 0.50)
 
 
+def recompute_profit_target_debit(net_credit: float, target_pct: float, multiplier: int,
+                                   contracts: int, round_trip_fees: float) -> float:
+    """Debit price that locks in target_pct of max profit AFTER fees:
+    (net_credit - D)*multiplier*contracts - round_trip_fees == target_pct*net_max_profit.
+    Pulled out of build_iron_butterfly so condor_order_executor.py can
+    re-run it against the ACTUAL as-filled net_credit -- build_iron_butterfly
+    only ever sees the pre-fill planning mid-price, which the entry chase
+    (config.py's ENTRY_CHASE_*) almost always walks away from to get
+    filled. Bug found 2026-11-04: the position's profit_target_debit was
+    being left at this pre-fill value, so a trade filled below planning
+    credit exited at less than CONDOR_PROFIT_TARGET_PCT of what it
+    actually captured (a live $3.33 fill vs a $3.45 plan locked in ~22.6%
+    instead of 25%)."""
+    net_max_profit = net_credit * multiplier * contracts - round_trip_fees
+    net_target_profit_dollars = target_pct * net_max_profit
+    return _floor_to_cent(net_credit - (
+        (net_target_profit_dollars + round_trip_fees) / (multiplier * contracts)
+    ))
+
+
+def _floor_to_cent(x: float) -> float:
+    """Round DOWN to the nearest cent, never up or to-nearest. Both
+    profit-target debits are "the most you may pay and still lock in
+    AT LEAST target_pct of profit" -- rounding up (or Python's default
+    round-to-nearest/-even) could land on a debit that pays slightly
+    MORE than the true target price, capturing slightly LESS than
+    target_pct. Flooring never does. User 2026-10-27: "you should also
+    round down or truncate (i.e. 1.1553 should distill to 1.15)." The
+    tiny epsilon before flooring guards against float noise (a true
+    1.15 landing as 1.1499999999996 and getting floored down an extra
+    cent it shouldn't)."""
+    return math.floor(x * 100 + 1e-9) / 100.0
+
+
 def select_short_strike(chain: ChainSnapshot) -> tuple:
     """Nearest strike to the underlying price; ties broken toward the
     strike whose call+put |delta| are jointly closest to 0.50. Requires
@@ -144,10 +179,20 @@ def select_short_strike(chain: ChainSnapshot) -> tuple:
 
 def select_wing(legs: List[LegQuote], short_strike: float, side: str,
                  target_delta: float = 0.10) -> LegQuote:
-    """Pick the leg whose |delta| is closest to target_delta, restricted
-    to strikes strictly below (side="put") or above (side="call") the
-    short strike. Wings are chosen by delta, not fixed width -- the
-    caller must not assume call/put wing widths match."""
+    """Pick the leg closest to target_delta, restricted to strikes
+    strictly below (side="put") or above (side="call") the short
+    strike. Wings are chosen by delta, not fixed width -- the caller
+    must not assume call/put wing widths match.
+
+    2026-10-27, user: "I don't want a delta less than 10 but I'll
+    accept more than 10. Closest to 10 without going under." -- NEVER
+    pick a wing with |delta| < target_delta while any candidate has
+    |delta| >= target_delta; among those, pick whichever is closest to
+    target_delta (least excess above it). A wing under the target is
+    weaker protection than intended, so if every candidate is under
+    target_delta, this aborts (IronButterflyError) rather than quietly
+    accept one -- same "skip the day" posture as the far-wing-tolerance
+    check in build_iron_butterfly."""
     if side == "put":
         candidates = [l for l in legs if l.strike < short_strike]
     elif side == "call":
@@ -161,41 +206,43 @@ def select_wing(legs: List[LegQuote], short_strike: float, side: str,
             f"No {side} strikes {'below' if side == 'put' else 'above'} "
             f"the short strike (${short_strike:.2f}) with a usable delta."
         )
-    return min(candidates, key=lambda l: abs(abs(l.delta) - target_delta))
+
+    at_or_above = [l for l in candidates if abs(l.delta) >= target_delta]
+    if not at_or_above:
+        closest_available = max(abs(l.delta) for l in candidates)
+        raise IronButterflyError(
+            f"No {side} strike has |delta| >= target {target_delta:.2f} "
+            f"(closest available is |delta|={closest_available:.3f}) -- "
+            f"refusing to pick an under-protected wing."
+        )
+    return min(at_or_above, key=lambda l: abs(l.delta) - target_delta)
 
 
 def build_iron_butterfly(
     chain: ChainSnapshot,
     *,
     target_wing_delta: float = 0.10,
-    wing_delta_tolerance: float = 0.03,
-    allow_far_wings: bool = False,
     target_pct: float = 0.25,
     contracts: int = 1,
     multiplier: int = 100,
 ) -> IronButterflyResult:
+    """2026-10-27, user: "I don't need a 3 point buffer. I don't want to
+    get below 10 and I want the closest strike to 10." -- there used to
+    be a second check here that aborted whenever the wing select_wing()
+    picked was more than wing_delta_tolerance away from target, with an
+    allow_far_wings escape hatch. Removed: select_wing() already
+    enforces exactly what's wanted (never under target_delta, closest
+    available at or above it) and already aborts on its own if NO
+    candidate clears target_delta at all -- a second, separate
+    distance-based abort on top of that was rejecting valid picks
+    (e.g. a 16-delta wing, the closest available above 10 that day)
+    for being numerically far from 10, which is not what "closest to
+    10 without going under" means."""
     short_strike, short_call, short_put = select_short_strike(chain)
     long_put = select_wing(chain.puts, short_strike, "put", target_wing_delta)
     long_call = select_wing(chain.calls, short_strike, "call", target_wing_delta)
 
     warnings: List[str] = []
-
-    # --- wing-delta closeness check (abort, unless allow_far_wings) ------
-    for leg, side in ((long_put, "put"), (long_call, "call")):
-        diff = abs(abs(leg.delta) - target_wing_delta)
-        if diff > wing_delta_tolerance:
-            msg = (
-                f"{side} wing (strike ${leg.strike:.2f}) has |delta|={abs(leg.delta):.3f}, "
-                f"{diff:.3f} away from target {target_wing_delta:.2f} "
-                f"(tolerance {wing_delta_tolerance:.2f})"
-            )
-            if allow_far_wings:
-                warnings.append(f"WARNING: {msg} -- proceeding (--allow-far-wings)")
-                _log.warning(msg)
-            else:
-                raise IronButterflyError(
-                    f"{msg}. Pass --allow-far-wings to proceed anyway."
-                )
 
     # --- missing-quote / zero-bid-on-a-long-wing checks -------------------
     for leg, label in (
@@ -237,7 +284,7 @@ def build_iron_butterfly(
     credit_to_width_call = net_credit / call_wing_width
     credit_to_width_put = net_credit / put_wing_width
 
-    gross_profit_target_debit = net_credit * (1 - target_pct)
+    gross_profit_target_debit = _floor_to_cent(net_credit * (1 - target_pct))
     capital_at_risk = max_loss * multiplier * contracts
 
     entry_fee_dollars = _fees.entry_fees(contracts)
@@ -249,11 +296,8 @@ def build_iron_butterfly(
     net_max_loss = capital_at_risk + round_trip_fee_dollars
     net_reward_to_risk = net_max_profit / net_max_loss if net_max_loss > 0 else 0.0
 
-    # Debit price that locks in target_pct of max profit AFTER fees:
-    # (net_credit - D)*multiplier*contracts - round_trip_fees == target_pct*net_max_profit
-    net_target_profit_dollars = target_pct * net_max_profit
-    profit_target_debit = net_credit - (
-        (net_target_profit_dollars + round_trip_fee_dollars) / (multiplier * contracts)
+    profit_target_debit = recompute_profit_target_debit(
+        net_credit, target_pct, multiplier, contracts, round_trip_fee_dollars,
     )
 
     return IronButterflyResult(
@@ -271,6 +315,119 @@ def build_iron_butterfly(
         entry_fees=entry_fee_dollars, exit_fees=exit_fee_dollars, round_trip_fees=round_trip_fee_dollars,
         net_max_profit=net_max_profit, net_max_loss=net_max_loss, net_reward_to_risk=net_reward_to_risk,
         warnings=warnings,
+    )
+
+
+@dataclass
+class UntestedSideRoll:
+    """The new short+wing pair for rolling an open position's UNTESTED
+    side closer to the money -- see select_untested_short/
+    build_untested_side_roll."""
+    side: str                  # "call" or "put" -- the side being rolled
+    new_short: LegQuote
+    new_wing: LegQuote
+    new_short_strike: float
+    new_wing_strike: float
+    new_wing_width: float      # per share
+    roll_credit: float         # per share, GROSS, mid-based -- THIS NEW SPREAD'S
+                                # own planning credit only. Does NOT net out what it
+                                # costs to close the old spread being replaced -- the
+                                # caller combines this with a live quote on the old
+                                # legs to get the roll's real net cash flow.
+
+
+def select_untested_short(legs: List[LegQuote], side: str, current_price: float,
+                           target_delta: float = 0.30, *,
+                           opposite_strike: Optional[float] = None) -> LegQuote:
+    """Pick a NEW short strike for the untested side when rolling it
+    closer for extra credit (the tastytrade-style defense, not a
+    recenter of the whole structure). Same 'closest to target_delta
+    without going under' rule as select_wing. OTM is defined against
+    the CURRENT underlying price (call strikes above it, put strikes
+    below) -- AND, when `opposite_strike` is given, against the short
+    strike still open on the OTHER (tested) side, so a roll can never
+    cross the two spreads over each other. `opposite_strike` is the
+    tested side's own short strike (e.g. the still-open short put when
+    rolling the call side): the new call short must stay above it,
+    the new put short must stay below it -- not just OTM of spot,
+    which alone let a roll pick a strike inside the other spread when
+    price had already moved past it (see Nov 5 2026 incident: call
+    rolled to $743, UNDER the open $754 short put)."""
+    if side == "put":
+        floor = current_price if opposite_strike is None else min(current_price, opposite_strike)
+        candidates = [l for l in legs if l.strike < floor]
+    elif side == "call":
+        floor = current_price if opposite_strike is None else max(current_price, opposite_strike)
+        candidates = [l for l in legs if l.strike > floor]
+    else:
+        raise ValueError(f"side must be 'put' or 'call', got {side!r}")
+
+    candidates = [l for l in candidates if l.delta is not None]
+    if not candidates:
+        bound_desc = f"the current price (${current_price:.2f})"
+        if opposite_strike is not None:
+            bound_desc += f" and the open short {'call' if side == 'put' else 'put'} (${opposite_strike:.2f})"
+        raise IronButterflyError(
+            f"No {side} strikes {'below' if side == 'put' else 'above'} "
+            f"{bound_desc} with a usable delta."
+        )
+
+    at_or_above = [l for l in candidates if abs(l.delta) >= target_delta]
+    if not at_or_above:
+        closest_available = max(abs(l.delta) for l in candidates)
+        raise IronButterflyError(
+            f"No {side} strike has |delta| >= target {target_delta:.2f} "
+            f"(closest available is |delta|={closest_available:.3f}) -- "
+            f"refusing to roll to an under-targeted strike."
+        )
+    return min(at_or_above, key=lambda l: abs(l.delta) - target_delta)
+
+
+def build_untested_side_roll(
+    chain: ChainSnapshot, *, side: str,
+    short_target_delta: float = 0.30,
+    wing_target_delta: float = 0.10,
+    opposite_strike: Optional[float] = None,
+) -> UntestedSideRoll:
+    """Build a new, closer short+wing pair for the UNTESTED side of an
+    already-open iron butterfly/condor -- the tastytrade-style defense
+    of rolling the safe side in for more credit, rather than touching
+    the side that's actually losing. `side` is "call" or "put": the
+    side NOT being tested (the caller decides which, from the open
+    position's own breakeven math -- see daily_loop.evaluate_defend).
+    `opposite_strike` is the tested side's own still-open short strike
+    (pass position.short_put.strike when side="call", or
+    position.short_call.strike when side="put") -- it's forwarded to
+    select_untested_short as the hard floor/ceiling that keeps the
+    roll from crossing into the other spread.
+
+    The new short is picked off current OTM delta, bounded by both
+    the underlying price and `opposite_strike` (select_untested_short),
+    then given its own protective wing the same way entry does
+    (select_wing, reusing the same target-delta discipline -- never
+    under target, closest available at or above it)."""
+    legs = chain.calls if side == "call" else chain.puts
+    new_short = select_untested_short(legs, side, chain.underlying_price, short_target_delta,
+                                       opposite_strike=opposite_strike)
+    new_wing = select_wing(legs, new_short.strike, side, wing_target_delta)
+
+    for leg, label in ((new_short, "new short"), (new_wing, "new wing")):
+        if leg.bid is None or leg.ask is None:
+            raise IronButterflyError(f"{label} (strike ${leg.strike:.2f}) has no bid/ask quote.")
+
+    roll_credit = new_short.mid - new_wing.mid
+    new_wing_width = (new_wing.strike - new_short.strike) if side == "call" else (new_short.strike - new_wing.strike)
+
+    if roll_credit >= new_wing_width:
+        raise IronButterflyError(
+            f"Roll credit (${roll_credit:.2f}) >= new wing width (${new_wing_width:.2f}) -- "
+            f"would leave zero or negative max loss on the rolled side, refusing."
+        )
+
+    return UntestedSideRoll(
+        side=side, new_short=new_short, new_wing=new_wing,
+        new_short_strike=new_short.strike, new_wing_strike=new_wing.strike,
+        new_wing_width=new_wing_width, roll_credit=roll_credit,
     )
 
 
@@ -292,7 +449,12 @@ def chain_snapshot_from_dict(data: dict) -> ChainSnapshot:
     )
 
 
-CHAIN_WINDOW_POINTS = 40   # only quote strikes within this many $ of the underlying
+CHAIN_WINDOW_PCT = 0.05    # only quote strikes within this fraction of the underlying price --
+                            # relative, not a fixed $ amount, so it scales across symbols at very
+                            # different price levels (SPY ~$770 vs SPX ~$7700). 5% matches the old
+                            # fixed $40 window at SPY's price (40/770 ~= 5.2%) and comfortably covers
+                            # the wider (~$70, ~0.9%) 0.10-delta wing distance seen on a live SPX
+                            # chain check (2026-10-27) with real margin to spare.
 QUOTE_CHUNK_SIZE = 50      # symbols per batch-quote REST call
 
 
@@ -312,7 +474,7 @@ def _chunked_batch_quotes(options_chain, symbols: list) -> dict:
 
 def fetch_chain_snapshot(options_chain, symbol: str = "SPY") -> ChainSnapshot:
     """Build a ChainSnapshot from the live OptionsChain (options.py),
-    fetching bid/ask/delta for strikes within CHAIN_WINDOW_POINTS of the
+    fetching bid/ask/delta for strikes within CHAIN_WINDOW_PCT of the
     underlying price in today's 0DTE expiration, chunked across several
     batch-quote REST calls (see _chunked_batch_quotes).
 
@@ -346,11 +508,12 @@ def fetch_chain_snapshot(options_chain, symbol: str = "SPY") -> ChainSnapshot:
         val = s.get("strike-price") or s.get("strikePrice") or s.get("strike_price") or 0
         return float(val) if val else 0.0
 
+    chain_window_points = underlying_price * CHAIN_WINDOW_PCT
     call_symbols, put_symbols = [], []
     by_call_sym, by_put_sym = {}, {}
     for s in strikes:
         px = strike_price(s)
-        if abs(px - underlying_price) > CHAIN_WINDOW_POINTS:
+        if abs(px - underlying_price) > chain_window_points:
             continue
         call_sym = s.get("call") or s.get("call-streamer-symbol")
         put_sym = s.get("put") or s.get("put-streamer-symbol")
@@ -420,7 +583,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Build and price a 0DTE SPY iron butterfly.")
     parser.add_argument("--input", required=True, help="JSON chain snapshot file (see chain_snapshot_from_dict).")
     parser.add_argument("--target-pct", type=float, default=0.25, help="Profit target as a fraction of net credit (default 0.25).")
-    parser.add_argument("--allow-far-wings", action="store_true", help="Warn instead of abort when a wing's delta is >0.03 from 0.10.")
     parser.add_argument("--contracts", type=int, default=1)
     parser.add_argument("--multiplier", type=int, default=100)
     args = parser.parse_args(argv)
@@ -430,7 +592,7 @@ def main(argv=None):
 
     try:
         result = build_iron_butterfly(
-            chain, allow_far_wings=args.allow_far_wings, target_pct=args.target_pct,
+            chain, target_pct=args.target_pct,
             contracts=args.contracts, multiplier=args.multiplier,
         )
     except IronButterflyError as e:

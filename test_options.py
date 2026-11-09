@@ -52,3 +52,32 @@ class TestGetEquityMidPrice:
         chain = _chain()
         with patch.object(chain, "get_equity_quote", return_value=None):
             assert chain.get_equity_mid_price("SPY") is None
+
+
+class TestGetVixDayChangePct:
+    def test_computes_pct_change_from_last_vs_prev_close(self):
+        chain = _chain()
+        with patch.object(chain, "get_equity_quote", return_value={"last": "26.06", "prev-close": "16.61"}) as mock_quote:
+            pct = chain.get_vix_day_change_pct()
+        mock_quote.assert_called_once_with("VIX")
+        assert pct == ((26.06 / 16.61) - 1) * 100
+
+    def test_negative_when_last_below_prev_close(self):
+        chain = _chain()
+        with patch.object(chain, "get_equity_quote", return_value={"last": "16.97", "prev-close": "20.83"}):
+            assert chain.get_vix_day_change_pct() < 0
+
+    def test_none_when_no_quote(self):
+        chain = _chain()
+        with patch.object(chain, "get_equity_quote", return_value=None):
+            assert chain.get_vix_day_change_pct() is None
+
+    def test_none_when_prev_close_missing_or_zero(self):
+        chain = _chain()
+        with patch.object(chain, "get_equity_quote", return_value={"last": "26.06", "prev-close": "0"}):
+            assert chain.get_vix_day_change_pct() is None
+
+    def test_none_when_last_missing_or_zero(self):
+        chain = _chain()
+        with patch.object(chain, "get_equity_quote", return_value={"last": "0", "prev-close": "16.61"}):
+            assert chain.get_vix_day_change_pct() is None

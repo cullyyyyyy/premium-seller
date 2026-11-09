@@ -717,3 +717,26 @@ class OptionsChain:
             return last
         logger.warning(f"No valid bid/ask/last for {symbol}")
         return None
+
+    def get_vix_day_change_pct(self) -> Optional[float]:
+        """VIX's live % change vs its own previous settled close, straight
+        off the quote's own last/prev-close fields -- confirmed live
+        2026-11-05 that /market-data/by-type?equity=VIX answers VIX (an
+        Index instrument-type) the same as ?index=VIX would, so this
+        reuses get_equity_quote rather than adding a second code path.
+        No separate historical fetch needed: Tastytrade's quote already
+        carries both numbers. Built for the VIX-recross-exit check in
+        daily_loop.py."""
+        quote = self.get_equity_quote("VIX")
+        if not quote:
+            logger.warning("No VIX quote returned")
+            return None
+        try:
+            last = float(quote.get("last") or 0)
+            prev_close = float(quote.get("prev-close") or 0)
+        except (TypeError, ValueError):
+            return None
+        if last <= 0 or prev_close <= 0:
+            logger.warning(f"No valid last/prev-close in VIX quote: {quote}")
+            return None
+        return (last / prev_close - 1) * 100

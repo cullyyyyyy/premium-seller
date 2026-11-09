@@ -4,8 +4,23 @@ import pytest
 
 from iron_butterfly import (
     ChainSnapshot, LegQuote, IronButterflyError,
-    select_short_strike, select_wing, build_iron_butterfly,
+    select_short_strike, select_wing, build_iron_butterfly, _floor_to_cent,
+    select_untested_short, build_untested_side_roll,
 )
+
+
+class TestFloorToCent:
+    def test_truncates_down_never_to_nearest(self):
+        """User 2026-10-27: 'you should also round down or truncate
+        (i.e. 1.1553 should distill to 1.15).' Plain round(1.1553, 2)
+        would give 1.16 (nearer) -- this must not."""
+        assert _floor_to_cent(1.1553) == 1.15
+
+    def test_already_exact_cent_is_unchanged(self):
+        assert _floor_to_cent(4.20) == 4.20
+
+    def test_float_noise_just_below_a_cent_boundary_does_not_floor_an_extra_cent(self):
+        assert _floor_to_cent(1.1499999999996) == 1.15
 
 
 def _leg(strike, delta, bid, ask, is_call):
@@ -113,6 +128,34 @@ class TestSelectWing:
         with pytest.raises(IronButterflyError):
             select_wing(above_only, 760.0, "put", target_delta=0.10)
 
+    def test_never_picks_under_target_when_an_at_or_above_candidate_exists(self):
+        """2026-10-27, user: 'I don't want a delta less than 10 but I'll
+        accept more than 10. Closest to 10 without going under.' A
+        delta of 0.09 is numerically closer to 0.10 than 0.13 is (0.01
+        vs 0.03 away), but 0.09 is UNDER target -- 0.13 must win."""
+        legs = [
+            LegQuote(strike=750.0, symbol="under", delta=-0.09, bid=0.10, ask=0.15),
+            LegQuote(strike=749.0, symbol="over", delta=-0.13, bid=0.20, ask=0.25),
+        ]
+        wing = select_wing(legs, 760.0, "put", target_delta=0.10)
+        assert wing.symbol == "over"
+
+    def test_picks_closest_at_or_above_when_multiple_qualify(self):
+        legs = [
+            LegQuote(strike=750.0, symbol="far_over", delta=-0.15, bid=0.10, ask=0.15),
+            LegQuote(strike=751.0, symbol="near_over", delta=-0.11, bid=0.20, ask=0.25),
+        ]
+        wing = select_wing(legs, 760.0, "put", target_delta=0.10)
+        assert wing.symbol == "near_over"
+
+    def test_aborts_when_every_candidate_is_under_target(self):
+        legs = [
+            LegQuote(strike=750.0, symbol="a", delta=-0.07, bid=0.10, ask=0.15),
+            LegQuote(strike=749.0, symbol="b", delta=-0.03, bid=0.05, ask=0.10),
+        ]
+        with pytest.raises(IronButterflyError, match="under-protected"):
+            select_wing(legs, 760.0, "put", target_delta=0.10)
+
 
 class TestBuildIronButterflyEconomics:
     def test_happy_path_matches_hand_computed_figures(self):
@@ -159,7 +202,11 @@ class TestBuildIronButterflyEconomics:
         assert math.isclose(r.net_max_loss, 244.964, abs_tol=1e-9)
         assert math.isclose(r.net_reward_to_risk, 555.036 / 244.964, abs_tol=1e-9)
         # profit_target_debit (NET): net_credit - (0.25*555.036 + 4.964)/100
-        assert math.isclose(r.profit_target_debit, 5.60 - (0.25 * 555.036 + 4.964) / 100, abs_tol=1e-9)
+        # = 5.60 - 1.43723 = 4.16277, FLOORED to the cent (never rounded
+        # up/nearest -- user 2026-10-27: "round down or truncate") -> 4.16.
+        raw_profit_target_debit = 5.60 - (0.25 * 555.036 + 4.964) / 100
+        assert math.isclose(raw_profit_target_debit, 4.16277, abs_tol=1e-9)
+        assert math.isclose(r.profit_target_debit, 4.16, abs_tol=1e-9)
         # The net target is more conservative than the gross one -- it takes
         # a LOWER debit (more of the credit given back) to actually realize
         # the same target_pct of profit once real fees are subtracted.
@@ -246,30 +293,134 @@ class TestSanityChecks:
         r = build_iron_butterfly(chain)
         assert r.short_call.bid == 0.0
 
-    def test_aborts_on_far_wing_delta_by_default(self):
+    def test_does_not_abort_on_a_wing_far_from_target_as_long_as_it_qualifies(self):
+        """2026-10-27, user: "I don't need a 3 point buffer. I don't want
+        to get below 10 and I want the closest strike to 10." -- there
+        used to be a second, separate distance-based abort in
+        build_iron_butterfly on top of select_wing's own logic; it's
+        gone now. A wing far from target_delta is accepted as long as
+        it's the closest available AT OR ABOVE target -- select_wing's
+        "nothing qualifies at all" check is the only abort left."""
         chain = _base_chain()
         for c in chain.calls:
             if c.strike == 766.0:
-                c.delta = 0.20  # 0.10 away from target 0.10 -- over the 0.03 tolerance
-        with pytest.raises(IronButterflyError, match="allow-far-wings"):
-            build_iron_butterfly(chain)
-
-    def test_allow_far_wings_warns_instead_of_aborting(self):
-        chain = _base_chain()
-        for c in chain.calls:
-            if c.strike == 766.0:
-                c.delta = 0.20
-        r = build_iron_butterfly(chain, allow_far_wings=True)
-        assert any("WARNING" in w for w in r.warnings)
-        # Whichever call ends up closest-to-target with 766 perturbed
-        # away, the point of this test is that it's still > tolerance
-        # from the target and got warned, not aborted.
-        assert abs(abs(r.long_call.delta) - 0.10) > 0.03
-
-    def test_wing_delta_within_tolerance_does_not_warn(self):
-        chain = _base_chain()
-        for c in chain.calls:
-            if c.strike == 766.0:
-                c.delta = 0.12  # within 0.03 of 0.10
+                c.delta = 0.20  # far from 0.10, but still a valid >= target pick
         r = build_iron_butterfly(chain)
+        assert r.long_call.strike == 766.0
         assert r.warnings == []
+
+
+class TestSelectUntestedShort:
+    def test_call_side_picks_closest_to_target_at_or_above(self):
+        chain = _base_chain()
+        leg = select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30)
+        assert leg.strike == 764.0  # exact 0.30 match
+
+    def test_put_side_picks_closest_to_target_at_or_above(self):
+        chain = _base_chain()
+        leg = select_untested_short(chain.puts, "put", current_price=760.0, target_delta=0.30)
+        assert leg.strike == 756.0  # exact -0.30 match
+
+    def test_never_picks_under_target_when_an_at_or_above_candidate_exists(self):
+        legs = [
+            LegQuote(strike=761.0, symbol="under", delta=0.09, bid=0.10, ask=0.15),
+            LegQuote(strike=762.0, symbol="over", delta=0.13, bid=0.20, ask=0.25),
+        ]
+        leg = select_untested_short(legs, "call", current_price=760.0, target_delta=0.10)
+        assert leg.symbol == "over"
+
+    def test_raises_if_no_strikes_on_the_correct_side_of_current_price(self):
+        chain = _base_chain()
+        above_only = [l for l in chain.calls if l.strike > 760.0]
+        with pytest.raises(IronButterflyError, match="usable delta"):
+            select_untested_short(above_only, "put", current_price=760.0, target_delta=0.30)
+
+    def test_raises_if_every_candidate_is_under_target(self):
+        legs = [
+            LegQuote(strike=769.0, symbol="a", delta=0.02, bid=0.05, ask=0.10),
+            LegQuote(strike=770.0, symbol="b", delta=0.01, bid=0.02, ask=0.05),
+        ]
+        with pytest.raises(IronButterflyError, match="under-targeted"):
+            select_untested_short(legs, "call", current_price=760.0, target_delta=0.30)
+
+    def test_opposite_strike_excludes_a_candidate_between_it_and_current_price(self):
+        """opposite_strike=765 sits just above the strike that's normally
+        picked (764, delta exactly 0.30 -- see
+        test_call_side_picks_closest_to_target_at_or_above). With the
+        guard active, 764 is excluded even though it's OTM of current
+        price (760), the same way it would be if it were ITM -- leaving
+        only 766+ (deltas 0.10 and under), which fail the delta target.
+        This is the Nov 5 2026 incident reproduced directly: a strike
+        that's OTM of spot but UNDER the tested side's open short strike
+        must not be selectable."""
+        chain = _base_chain()
+        with pytest.raises(IronButterflyError, match="under-targeted"):
+            select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30,
+                                   opposite_strike=765.0)
+
+    def test_opposite_strike_is_ignored_when_it_does_not_bind(self):
+        """opposite_strike below current_price (call side) should change
+        nothing -- current_price is still the tighter bound."""
+        chain = _base_chain()
+        leg = select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30,
+                                     opposite_strike=700.0)
+        assert leg.strike == 764.0
+
+    def test_opposite_strike_message_names_the_open_short_when_no_candidate_survives(self):
+        chain = _base_chain()
+        with pytest.raises(IronButterflyError, match=r"open short put \(\$771\.00\)"):
+            select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30,
+                                   opposite_strike=771.0)
+
+    def test_opposite_strike_binds_on_put_side_too(self):
+        chain = _base_chain()
+        with pytest.raises(IronButterflyError, match=r"open short call \(\$-1\.00\)"):
+            select_untested_short(chain.puts, "put", current_price=760.0, target_delta=0.30,
+                                   opposite_strike=-1.0)
+
+
+class TestBuildUntestedSideRoll:
+    def test_call_side_roll_matches_hand_computed_figures(self):
+        chain = _base_chain()
+        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
+        assert roll.side == "call"
+        assert roll.new_short_strike == 764.0
+        assert roll.new_wing_strike == 766.0
+        assert roll.new_wing_width == 2.0
+        # new short mid=(1.80+1.85)/2=1.825, new wing mid=(0.20+0.25)/2=0.225 (overridden in _base_chain)
+        assert round(roll.roll_credit, 3) == round(1.825 - 0.225, 3)
+
+    def test_put_side_roll_matches_hand_computed_figures(self):
+        chain = _base_chain()
+        roll = build_untested_side_roll(chain, side="put", short_target_delta=0.30, wing_target_delta=0.10)
+        assert roll.side == "put"
+        assert roll.new_short_strike == 756.0
+        assert roll.new_wing_strike == 752.0
+        assert roll.new_wing_width == 4.0
+        # new short mid=(1.80+1.85)/2=1.825, new wing mid=(0.15+0.20)/2=0.175 (overridden in _base_chain)
+        assert round(roll.roll_credit, 3) == round(1.825 - 0.175, 3)
+
+    def test_raises_if_roll_credit_would_leave_non_positive_max_loss(self):
+        legs = [
+            LegQuote(strike=761.0, symbol="short", delta=0.40, bid=2.00, ask=2.05),
+            LegQuote(strike=762.0, symbol="wing", delta=0.10, bid=0.05, ask=0.10),
+        ]
+        chain = ChainSnapshot(underlying_price=760.0, calls=legs, puts=[])
+        with pytest.raises(IronButterflyError, match="would leave zero or negative max loss"):
+            build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
+
+    def test_opposite_strike_forwarded_blocks_a_roll_that_would_cross_the_other_side(self):
+        """End-to-end version of the Nov 5 2026 incident: without
+        opposite_strike, this call-side roll would land on 764 (see
+        test_call_side_roll_matches_hand_computed_figures). Passing the
+        tested side's open short put (765) as opposite_strike must
+        refuse the roll instead of building a crossed structure."""
+        chain = _base_chain()
+        with pytest.raises(IronButterflyError, match="under-targeted"):
+            build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10,
+                                      opposite_strike=765.0)
+
+    def test_opposite_strike_defaults_to_none_and_does_not_change_existing_behavior(self):
+        chain = _base_chain()
+        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
+        assert roll.new_short_strike == 764.0

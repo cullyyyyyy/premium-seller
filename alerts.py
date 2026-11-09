@@ -12,6 +12,7 @@ in daily_loop.py that used to just log an error now also alerts.
 import json
 import logging
 import urllib.request
+from typing import Optional
 
 from config import ALERT_SLACK_WEBHOOK_URL
 
@@ -47,13 +48,33 @@ def notify_no_entry(reason: str) -> None:
     _post(f"⚪ *No trade today* · {reason}")
 
 
-def notify_exit(reason: str, exit_debit: float, realized_pnl: float) -> None:
+def notify_exit(reason: str, exit_debit: float, realized_pnl: float,
+                 net_credit: Optional[float] = None) -> None:
+    """net_credit: total premium collected at entry (entry_net_credit *
+    multiplier * contracts), dollars -- the percentage is realized P&L
+    as a fraction of what was actually collected, not of the structural
+    max-loss/capital_at_risk figure (user correction 2026-11-06: a day
+    that nets $137.04 against $548 collected is a 25% win, not ~18%)."""
     icon = "✅" if realized_pnl > 0 else "❌" if realized_pnl < 0 else "➖"
     sign = "+" if realized_pnl >= 0 else ""
+    pct_str = f" ({sign}{realized_pnl / net_credit * 100:.1f}%)" if net_credit else ""
     _post(
         f"{icon} *Iron butterfly closed* · {reason} · debit ${exit_debit:.2f}/share\n"
-        f"  Net P&L: *{sign}${realized_pnl:.2f}*"
+        f"  Net P&L: *{sign}${realized_pnl:.2f}*{pct_str}"
     )
+
+
+def notify_roll(side: str, new_short_strike: float, new_wing_strike: float,
+                 roll_net_credit: float, total_net_credit: float) -> None:
+    _post(
+        f"\U0001F504 *Rolled untested {side} side* closer for extra credit\n"
+        f"  New short ${new_short_strike:.2f} / wing ${new_wing_strike:.2f}  ·  "
+        f"Roll credit: ${roll_net_credit:.2f}/share  ·  Total net credit now: ${total_net_credit:.2f}/share"
+    )
+
+
+def notify_roll_failed(side: str, reason: str) -> None:
+    _post(f"⚠️ *Untested {side} side roll did not go through* · {reason}")
 
 
 def notify_backstop_failure(attempts: int, last_price_override: float) -> None:

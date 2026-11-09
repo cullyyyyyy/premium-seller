@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import condor_order_executor as coe
-from iron_butterfly import build_iron_butterfly
+from iron_butterfly import build_iron_butterfly, build_untested_side_roll
 from test_iron_butterfly import _base_chain
 
 
@@ -124,6 +124,84 @@ class TestPaperModeExit:
         executor._session = MagicMock()
         with patch.object(coe, "EXECUTE_ORDERS", False):
             executor.submit_exit(position, quotes, reason="backstop")
+        executor._session.post.assert_not_called()
+
+
+class TestPaperModeUntestedRoll:
+    def _open_position(self):
+        result = _sample_result(contracts=1)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+        return executor, position
+
+    def test_rolls_the_call_side_and_updates_the_position(self):
+        executor, position = self._open_position()
+        chain = _base_chain()
+        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
+        assert roll.new_short_strike == 764.0
+        assert roll.new_wing_strike == 766.0
+
+        old_short_quote = (0.10, 0.15)   # old $760 call has decayed cheap -- the untested, safe side
+        old_wing_quote = (0.01, 0.02)
+        old_quotes = {position.short_call.symbol: old_short_quote, position.long_call.symbol: old_wing_quote}
+
+        original_entry_net_credit = position.entry_net_credit
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            order_result = executor.submit_untested_roll(position, roll, old_quotes)
+
+        close_cost = old_short_quote[1] - old_wing_quote[0]          # buy back short at ask, sell wing at bid
+        open_credit = roll.new_short.bid - roll.new_wing.ask          # realistic marketable fill
+        expected_net_credit = open_credit - close_cost
+
+        assert order_result.status == coe.OrderStatus.FILLED
+        assert math.isclose(order_result.net_price, expected_net_credit, abs_tol=1e-9)
+
+        assert position.short_call.strike == 764.0
+        assert position.short_call.symbol == roll.new_short.symbol
+        assert position.short_call.entry_action == "Sell to Open"
+        assert position.long_call.strike == 766.0
+        assert position.long_call.entry_action == "Buy to Open"
+        # The tested (put) side is untouched by a call-side roll.
+        assert position.short_put.strike == 760.0
+        assert position.long_put.strike == 752.0
+
+        assert math.isclose(position.entry_net_credit, original_entry_net_credit + expected_net_credit, abs_tol=1e-9)
+        assert position.rolled_side == "call"
+        assert position.rolls_used == 1
+
+        call_wing_width = position.long_call.strike - position.short_call.strike  # 2.0
+        put_wing_width = position.short_put.strike - position.long_put.strike      # 8.0
+        expected_max_loss = max(call_wing_width - position.entry_net_credit,
+                                 put_wing_width - position.entry_net_credit)
+        assert math.isclose(position.max_loss, expected_max_loss, abs_tol=1e-9)
+
+    def test_rolls_the_put_side_leaves_call_side_untouched(self):
+        executor, position = self._open_position()
+        chain = _base_chain()
+        roll = build_untested_side_roll(chain, side="put", short_target_delta=0.30, wing_target_delta=0.10)
+        old_quotes = {
+            position.short_put.symbol: (0.10, 0.15),
+            position.long_put.symbol: (0.01, 0.02),
+        }
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            executor.submit_untested_roll(position, roll, old_quotes)
+
+        assert position.short_put.strike == 756.0
+        assert position.long_put.strike == 752.0
+        assert position.short_call.strike == 760.0
+        assert position.long_call.strike == 766.0
+        assert position.rolled_side == "put"
+        assert position.rolls_used == 1
+
+    def test_paper_roll_never_calls_the_http_session(self):
+        executor, position = self._open_position()
+        chain = _base_chain()
+        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
+        old_quotes = {position.short_call.symbol: (0.10, 0.15), position.long_call.symbol: (0.01, 0.02)}
+        executor._session = MagicMock()
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            executor.submit_untested_roll(position, roll, old_quotes)
         executor._session.post.assert_not_called()
 
 
@@ -507,3 +585,293 @@ class TestLiveModeHttpPlumbing:
         executor = self._executor_with_mock_session()
         executor._session.delete.return_value = MagicMock(status_code=422)
         assert executor._cancel_order("order-1") is True
+
+
+class TestRestingExit:
+    """2026-10-27, user: "After an order gets filled, you can add a day
+    limit order to sell at whatever value is 25% profit[,] that would
+    be most efficient." submit_resting_exit posts and returns
+    immediately (no poll/cancel-on-timeout, unlike submit_exit);
+    poll_resting_exit/cancel_resting_exit manage it afterward."""
+
+    def _open_position(self):
+        result = _sample_result(contracts=2)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+        return executor, position
+
+    def test_submit_resting_exit_posts_once_and_returns_without_polling(self):
+        executor, position = self._open_position()
+        executor._session = MagicMock()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "resting-1"}}}
+        executor._session.post.return_value = post_resp
+
+        with patch.object(coe, "EXECUTE_ORDERS", True):
+            result = executor.submit_resting_exit(position, 0.50, reason="profit_target")
+
+        assert result.status == coe.OrderStatus.SUBMITTED
+        assert result.order_id == "resting-1"
+        executor._session.get.assert_not_called()  # no polling -- returns immediately
+        sent_payload = executor._session.post.call_args.kwargs["json"]
+        assert sent_payload["time-in-force"] == "Day"
+        assert sent_payload["price"] == 0.50
+        assert sent_payload["price-effect"] == "Debit"
+
+    def test_submit_resting_exit_raises_in_paper_mode(self):
+        executor, position = self._open_position()
+        with pytest.raises(RuntimeError):
+            executor.submit_resting_exit(position, 0.50, reason="profit_target")
+
+    def test_poll_resting_exit_finalizes_on_fill_with_correct_sign(self):
+        executor, position = self._open_position()
+        position.entry_net_credit = 1.16
+        executor._session = MagicMock()
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {"data": {
+            "status": "Filled",
+            "legs": [
+                {"action": "Buy to Close", "fills": [{"fill-price": "0.49", "quantity": 2}]},
+                {"action": "Buy to Close", "fills": [{"fill-price": "0.85", "quantity": 2}]},
+                {"action": "Sell to Close", "fills": [{"fill-price": "0.05", "quantity": 2}]},
+                {"action": "Sell to Close", "fills": [{"fill-price": "0.08", "quantity": 2}]},
+            ],
+        }}
+        executor._session.get.return_value = get_resp
+
+        filled = executor.poll_resting_exit(position, "resting-1", reason="profit_target")
+
+        assert filled is True
+        assert position.status == "closed"
+        expected_debit = (0.49 + 0.85) - (0.05 + 0.08)
+        assert math.isclose(position.exit_debit, expected_debit, abs_tol=1e-9)
+        assert position.exit_reason == "profit_target"
+
+    def test_poll_resting_exit_returns_false_while_still_live(self):
+        executor, position = self._open_position()
+        executor._session = MagicMock()
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {"data": {"status": "live", "legs": []}}
+        executor._session.get.return_value = get_resp
+
+        filled = executor.poll_resting_exit(position, "resting-1", reason="profit_target")
+
+        assert filled is False
+        assert position.status == "open"
+
+    def test_cancel_resting_exit_delegates_to_cancel_order(self):
+        executor, position = self._open_position()
+        executor._session = MagicMock()
+        executor._session.delete.return_value = MagicMock(status_code=201)
+
+        assert executor.cancel_resting_exit("resting-1") is True
+        called_url = executor._session.delete.call_args.args[0]
+        assert called_url.endswith("/orders/resting-1")
+
+
+def _filled_entry_get_resp(result, fill_price_per_leg):
+    """fill_price_per_leg: {symbol: fill_price}, one entry per leg."""
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"data": {
+        "status": "Filled",
+        "legs": [
+            {"action": "Sell to Open", "fills": [{"fill-price": str(fill_price_per_leg[result.short_call.symbol]), "quantity": result.contracts}]},
+            {"action": "Sell to Open", "fills": [{"fill-price": str(fill_price_per_leg[result.short_put.symbol]), "quantity": result.contracts}]},
+            {"action": "Buy to Open", "fills": [{"fill-price": str(fill_price_per_leg[result.long_call.symbol]), "quantity": result.contracts}]},
+            {"action": "Buy to Open", "fills": [{"fill-price": str(fill_price_per_leg[result.long_put.symbol]), "quantity": result.contracts}]},
+        ],
+    }}
+    return resp
+
+
+def _cancelled_entry_get_resp():
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"data": {"status": "Cancelled", "legs": []}}
+    return resp
+
+
+class TestLiveModeEntryChase:
+    """IOC limit-chase for the entry order -- added 2026-10-27 after a
+    real scheduled run submitted one Day order at the net-credit mid,
+    got no fill within ORDER_FILL_TIMEOUT_SEC (10s), and gave up with no
+    trade that day. User's correction on the concession size: "5 cents
+    is too much, it has to be 1 cent" -- ENTRY_CHASE_STEP=0.01."""
+
+    def _executor_with_mock_session(self):
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        executor._session = MagicMock()
+        return executor
+
+    def test_fills_on_first_attempt_at_the_mid_no_concession(self):
+        result = _sample_result(contracts=1)
+        executor = self._executor_with_mock_session()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+        fills = {
+            result.short_call.symbol: 3.00, result.short_put.symbol: 2.90,
+            result.long_call.symbol: 0.25, result.long_put.symbol: 0.20,
+        }
+        executor._session.get.return_value = _filled_entry_get_resp(result, fills)
+
+        with patch.object(coe, "EXECUTE_ORDERS", True):
+            order_result, position = executor.submit_entry(result)
+
+        assert order_result.status == coe.OrderStatus.FILLED
+        assert executor._session.post.call_count == 1
+        sent_payload = executor._session.post.call_args.kwargs["json"]
+        assert sent_payload["time-in-force"] == "IOC"
+        assert sent_payload["price"] == round(result.net_credit, 2)
+        assert position is not None
+        assert position.entry_net_credit == order_result.net_price
+
+    def test_misses_then_fills_after_stepping_down_one_cent_per_attempt(self):
+        result = _sample_result(contracts=1)
+        executor = self._executor_with_mock_session()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+        fills = {
+            result.short_call.symbol: 3.00, result.short_put.symbol: 2.90,
+            result.long_call.symbol: 0.25, result.long_put.symbol: 0.20,
+        }
+        executor._session.get.side_effect = [
+            _cancelled_entry_get_resp(), _cancelled_entry_get_resp(),
+            _filled_entry_get_resp(result, fills),
+        ]
+
+        with patch.object(coe, "EXECUTE_ORDERS", True):
+            order_result, position = executor.submit_entry(result)
+
+        assert order_result.status == coe.OrderStatus.FILLED
+        assert executor._session.post.call_count == 3
+        prices_sent = [c.kwargs["json"]["price"] for c in executor._session.post.call_args_list]
+        mid = round(result.net_credit, 2)
+        assert prices_sent == [mid, round(mid - 0.01, 2), round(mid - 0.02, 2)]
+        assert position is not None
+
+    def test_aborts_after_consecutive_miss_streak_never_fills(self):
+        result = _sample_result(contracts=1)
+        executor = self._executor_with_mock_session()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+        executor._session.get.return_value = _cancelled_entry_get_resp()
+
+        with patch.object(coe, "EXECUTE_ORDERS", True):
+            order_result, position = executor.submit_entry(result)
+
+        assert order_result.status == coe.OrderStatus.TIMEOUT
+        assert position is None
+        from config import ENTRY_CHASE_ABORT_MISS_STREAK
+        assert executor._session.post.call_count == ENTRY_CHASE_ABORT_MISS_STREAK
+
+    def test_never_walks_past_the_max_walk_tick_floor(self):
+        """A miss streak long enough to reach the floor before the abort
+        counter does -- the chase must stop at the floor, not blow through
+        it waiting for the miss streak to catch up."""
+        result = _sample_result(contracts=1)
+        executor = self._executor_with_mock_session()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+        executor._session.get.return_value = _cancelled_entry_get_resp()
+
+        with patch.object(coe, "EXECUTE_ORDERS", True), \
+             patch.object(coe, "ENTRY_CHASE_MAX_WALK_TICKS", 2), \
+             patch.object(coe, "ENTRY_CHASE_ABORT_MISS_STREAK", 50):
+            order_result, position = executor.submit_entry(result)
+
+        assert order_result.status == coe.OrderStatus.TIMEOUT
+        assert position is None
+        # floor is 2 ticks (2 cents) below the mid -- attempts at mid, mid-0.01,
+        # mid-0.02 (the last one still >= floor), then mid-0.03 would be < floor
+        # so the loop stops: 3 attempts total.
+        assert executor._session.post.call_count == 3
+
+    def test_partial_fill_short_of_full_contracts_counts_as_a_miss(self):
+        """A 4-leg combo order is routed as one atomic unit, but guard the
+        case anyway: a status of "filled" with fewer contracts than asked
+        for must not be treated as a successful entry."""
+        result = _sample_result(contracts=3)
+        executor = self._executor_with_mock_session()
+        post_resp = MagicMock(status_code=201)
+        post_resp.json.return_value = {"data": {"order": {"id": "1"}}}
+        executor._session.post.return_value = post_resp
+        partial_resp = MagicMock(status_code=200)
+        partial_resp.json.return_value = {"data": {
+            "status": "Filled",
+            "legs": [
+                {"action": "Sell to Open", "fills": [{"fill-price": "3.00", "quantity": 1}]},
+                {"action": "Sell to Open", "fills": [{"fill-price": "2.90", "quantity": 1}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.25", "quantity": 1}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.20", "quantity": 1}]},
+            ],
+        }}
+        executor._session.get.return_value = partial_resp
+
+        with patch.object(coe, "EXECUTE_ORDERS", True), \
+             patch.object(coe, "ENTRY_CHASE_ABORT_MISS_STREAK", 2):
+            order_result, position = executor.submit_entry(result)
+
+        assert order_result.status == coe.OrderStatus.TIMEOUT
+        assert position is None
+
+    def test_poll_ioc_settle_cancels_explicitly_instead_of_assuming_self_cancel(self):
+        """Real finding, live 2026-10-27: an IOC order on SPXW sat in
+        "Received" indefinitely in the sandbox -- unlike SPY, it never
+        self-cancelled on its own. _poll_ioc_settle must not just assume
+        self-cancellation and time out silently; it has to actually issue
+        the cancel so a miss never leaves a live order resting unattended."""
+        executor = self._executor_with_mock_session()
+        received_resp = MagicMock(status_code=200)
+        received_resp.json.return_value = {"data": {"status": "received", "legs": []}}
+        executor._session.get.return_value = received_resp
+        executor._session.delete.return_value = MagicMock(status_code=201)
+
+        with patch.object(coe, "ENTRY_CHASE_SETTLE_TIMEOUT_SEC", 0.05), \
+             patch.object(coe, "ENTRY_CHASE_SETTLE_POLL_SEC", 0.01):
+            status, net_price, qty = executor._poll_ioc_settle("order-1")
+
+        assert status == coe.OrderStatus.TIMEOUT
+        executor._session.delete.assert_called_once()
+        called_url = executor._session.delete.call_args.args[0]
+        assert called_url.endswith("/orders/order-1")
+
+    def test_poll_ioc_settle_catches_a_fill_that_races_the_cancel(self):
+        """Same race _poll_fill already guards against (see its test for
+        the real incident), applied to the IOC settle path too: the order
+        can fill in the gap between the last poll and the cancel landing."""
+        executor = self._executor_with_mock_session()
+        received_resp = MagicMock(status_code=200)
+        received_resp.json.return_value = {"data": {"status": "received", "legs": []}}
+        filled_resp = MagicMock(status_code=200)
+        filled_resp.json.return_value = {"data": {
+            "status": "Filled",
+            "legs": [
+                {"action": "Sell to Open", "fills": [{"fill-price": "1.17", "quantity": 6}]},
+                {"action": "Sell to Open", "fills": [{"fill-price": "0.75", "quantity": 6}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.17", "quantity": 6}]},
+                {"action": "Buy to Open", "fills": [{"fill-price": "0.16", "quantity": 6}]},
+            ],
+        }}
+        cancel_issued = {"done": False}
+
+        def fake_delete(*a, **k):
+            cancel_issued["done"] = True
+            return MagicMock(status_code=422)  # "already terminal"
+
+        def fake_get(*a, **k):
+            return filled_resp if cancel_issued["done"] else received_resp
+
+        executor._session.delete.side_effect = fake_delete
+        executor._session.get.side_effect = fake_get
+
+        with patch.object(coe, "ENTRY_CHASE_SETTLE_TIMEOUT_SEC", 0.02), \
+             patch.object(coe, "ENTRY_CHASE_SETTLE_POLL_SEC", 0.01):
+            status, net_price, qty = executor._poll_ioc_settle("order-1")
+
+        assert status == coe.OrderStatus.FILLED
+        assert math.isclose(net_price, (1.17 + 0.75) - (0.17 + 0.16), abs_tol=1e-9)
+        assert qty == 6
