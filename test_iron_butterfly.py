@@ -5,7 +5,6 @@ import pytest
 from iron_butterfly import (
     ChainSnapshot, LegQuote, IronButterflyError,
     select_short_strike, select_wing, build_iron_butterfly, _floor_to_cent,
-    select_untested_short, build_untested_side_roll,
 )
 
 
@@ -310,117 +309,9 @@ class TestSanityChecks:
         assert r.warnings == []
 
 
-class TestSelectUntestedShort:
-    def test_call_side_picks_closest_to_target_at_or_above(self):
-        chain = _base_chain()
-        leg = select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30)
-        assert leg.strike == 764.0  # exact 0.30 match
-
-    def test_put_side_picks_closest_to_target_at_or_above(self):
-        chain = _base_chain()
-        leg = select_untested_short(chain.puts, "put", current_price=760.0, target_delta=0.30)
-        assert leg.strike == 756.0  # exact -0.30 match
-
-    def test_never_picks_under_target_when_an_at_or_above_candidate_exists(self):
-        legs = [
-            LegQuote(strike=761.0, symbol="under", delta=0.09, bid=0.10, ask=0.15),
-            LegQuote(strike=762.0, symbol="over", delta=0.13, bid=0.20, ask=0.25),
-        ]
-        leg = select_untested_short(legs, "call", current_price=760.0, target_delta=0.10)
-        assert leg.symbol == "over"
-
-    def test_raises_if_no_strikes_on_the_correct_side_of_current_price(self):
-        chain = _base_chain()
-        above_only = [l for l in chain.calls if l.strike > 760.0]
-        with pytest.raises(IronButterflyError, match="usable delta"):
-            select_untested_short(above_only, "put", current_price=760.0, target_delta=0.30)
-
-    def test_raises_if_every_candidate_is_under_target(self):
-        legs = [
-            LegQuote(strike=769.0, symbol="a", delta=0.02, bid=0.05, ask=0.10),
-            LegQuote(strike=770.0, symbol="b", delta=0.01, bid=0.02, ask=0.05),
-        ]
-        with pytest.raises(IronButterflyError, match="under-targeted"):
-            select_untested_short(legs, "call", current_price=760.0, target_delta=0.30)
-
-    def test_opposite_strike_excludes_a_candidate_between_it_and_current_price(self):
-        """opposite_strike=765 sits just above the strike that's normally
-        picked (764, delta exactly 0.30 -- see
-        test_call_side_picks_closest_to_target_at_or_above). With the
-        guard active, 764 is excluded even though it's OTM of current
-        price (760), the same way it would be if it were ITM -- leaving
-        only 766+ (deltas 0.10 and under), which fail the delta target.
-        This is the Nov 5 2026 incident reproduced directly: a strike
-        that's OTM of spot but UNDER the tested side's open short strike
-        must not be selectable."""
-        chain = _base_chain()
-        with pytest.raises(IronButterflyError, match="under-targeted"):
-            select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30,
-                                   opposite_strike=765.0)
-
-    def test_opposite_strike_is_ignored_when_it_does_not_bind(self):
-        """opposite_strike below current_price (call side) should change
-        nothing -- current_price is still the tighter bound."""
-        chain = _base_chain()
-        leg = select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30,
-                                     opposite_strike=700.0)
-        assert leg.strike == 764.0
-
-    def test_opposite_strike_message_names_the_open_short_when_no_candidate_survives(self):
-        chain = _base_chain()
-        with pytest.raises(IronButterflyError, match=r"open short put \(\$771\.00\)"):
-            select_untested_short(chain.calls, "call", current_price=760.0, target_delta=0.30,
-                                   opposite_strike=771.0)
-
-    def test_opposite_strike_binds_on_put_side_too(self):
-        chain = _base_chain()
-        with pytest.raises(IronButterflyError, match=r"open short call \(\$-1\.00\)"):
-            select_untested_short(chain.puts, "put", current_price=760.0, target_delta=0.30,
-                                   opposite_strike=-1.0)
-
-
-class TestBuildUntestedSideRoll:
-    def test_call_side_roll_matches_hand_computed_figures(self):
-        chain = _base_chain()
-        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
-        assert roll.side == "call"
-        assert roll.new_short_strike == 764.0
-        assert roll.new_wing_strike == 766.0
-        assert roll.new_wing_width == 2.0
-        # new short mid=(1.80+1.85)/2=1.825, new wing mid=(0.20+0.25)/2=0.225 (overridden in _base_chain)
-        assert round(roll.roll_credit, 3) == round(1.825 - 0.225, 3)
-
-    def test_put_side_roll_matches_hand_computed_figures(self):
-        chain = _base_chain()
-        roll = build_untested_side_roll(chain, side="put", short_target_delta=0.30, wing_target_delta=0.10)
-        assert roll.side == "put"
-        assert roll.new_short_strike == 756.0
-        assert roll.new_wing_strike == 752.0
-        assert roll.new_wing_width == 4.0
-        # new short mid=(1.80+1.85)/2=1.825, new wing mid=(0.15+0.20)/2=0.175 (overridden in _base_chain)
-        assert round(roll.roll_credit, 3) == round(1.825 - 0.175, 3)
-
-    def test_raises_if_roll_credit_would_leave_non_positive_max_loss(self):
-        legs = [
-            LegQuote(strike=761.0, symbol="short", delta=0.40, bid=2.00, ask=2.05),
-            LegQuote(strike=762.0, symbol="wing", delta=0.10, bid=0.05, ask=0.10),
-        ]
-        chain = ChainSnapshot(underlying_price=760.0, calls=legs, puts=[])
-        with pytest.raises(IronButterflyError, match="would leave zero or negative max loss"):
-            build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
-
-    def test_opposite_strike_forwarded_blocks_a_roll_that_would_cross_the_other_side(self):
-        """End-to-end version of the Nov 5 2026 incident: without
-        opposite_strike, this call-side roll would land on 764 (see
-        test_call_side_roll_matches_hand_computed_figures). Passing the
-        tested side's open short put (765) as opposite_strike must
-        refuse the roll instead of building a crossed structure."""
-        chain = _base_chain()
-        with pytest.raises(IronButterflyError, match="under-targeted"):
-            build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10,
-                                      opposite_strike=765.0)
-
-    def test_opposite_strike_defaults_to_none_and_does_not_change_existing_behavior(self):
-        chain = _base_chain()
-        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
-        assert roll.new_short_strike == 764.0
+# The former TestSelectUntestedShort/TestBuildUntestedSideRoll (the
+# untested-side roll's strike selection and spread construction) were
+# removed 2026-11-12 along with select_untested_short/build_untested_side_roll
+# themselves -- see config.py's CONDOR_DEFEND_ENABLED comment and
+# daily_loop.py's evaluate_defend for why rolling was replaced with
+# flattening the untested side.

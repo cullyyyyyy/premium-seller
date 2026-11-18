@@ -3,8 +3,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import fees
 import condor_order_executor as coe
-from iron_butterfly import build_iron_butterfly, build_untested_side_roll
+from iron_butterfly import build_iron_butterfly, recompute_profit_target_debit
 from test_iron_butterfly import _base_chain
 
 
@@ -127,7 +128,12 @@ class TestPaperModeExit:
         executor._session.post.assert_not_called()
 
 
-class TestPaperModeUntestedRoll:
+class TestPaperModeFlatten:
+    """close_vertical/_finalize_flatten -- replaces the old roll-the-
+    untested-side defense (retired 2026-11-12, see config.py's
+    CONDOR_DEFEND_ENABLED comment): closes just one side's 2 legs and
+    shrinks the position down to whatever's left open."""
+
     def _open_position(self):
         result = _sample_result(contracts=1)
         executor = coe.CondorOrderExecutor(session_token="tok")
@@ -135,73 +141,62 @@ class TestPaperModeUntestedRoll:
             _, position = executor.submit_entry(result)
         return executor, position
 
-    def test_rolls_the_call_side_and_updates_the_position(self):
+    def test_flattens_the_call_side_and_shrinks_position_to_put_only(self):
         executor, position = self._open_position()
-        chain = _base_chain()
-        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
-        assert roll.new_short_strike == 764.0
-        assert roll.new_wing_strike == 766.0
+        call_credit = position.call_side_entry_credit
+        put_credit = position.put_side_entry_credit
 
-        old_short_quote = (0.10, 0.15)   # old $760 call has decayed cheap -- the untested, safe side
-        old_wing_quote = (0.01, 0.02)
-        old_quotes = {position.short_call.symbol: old_short_quote, position.long_call.symbol: old_wing_quote}
-
-        original_entry_net_credit = position.entry_net_credit
+        quotes = {
+            position.short_call.symbol: (0.10, 0.15),  # decayed cheap -- near its own max profit
+            position.long_call.symbol: (0.01, 0.02),
+        }
         with patch.object(coe, "EXECUTE_ORDERS", False):
-            order_result = executor.submit_untested_roll(position, roll, old_quotes)
+            order_result = executor.close_vertical(position, "call", quotes)
 
-        close_cost = old_short_quote[1] - old_wing_quote[0]          # buy back short at ask, sell wing at bid
-        open_credit = roll.new_short.bid - roll.new_wing.ask          # realistic marketable fill
-        expected_net_credit = open_credit - close_cost
-
+        expected_debit = 0.15 - 0.01  # buy back short at ask, sell wing at bid
         assert order_result.status == coe.OrderStatus.FILLED
-        assert math.isclose(order_result.net_price, expected_net_credit, abs_tol=1e-9)
+        assert math.isclose(order_result.net_price, expected_debit, abs_tol=1e-9)
 
-        assert position.short_call.strike == 764.0
-        assert position.short_call.symbol == roll.new_short.symbol
-        assert position.short_call.entry_action == "Sell to Open"
-        assert position.long_call.strike == 766.0
-        assert position.long_call.entry_action == "Buy to Open"
-        # The tested (put) side is untouched by a call-side roll.
-        assert position.short_put.strike == 760.0
-        assert position.long_put.strike == 752.0
+        assert position.flattened_side == "call"
+        assert position.flatten_debit == expected_debit
+        expected_flatten_fee = fees.exit_fees(position.contracts, legs=2)
+        expected_flatten_pnl = (call_credit - expected_debit) * position.multiplier * position.contracts - expected_flatten_fee
+        assert math.isclose(position.flatten_pnl, expected_flatten_pnl, abs_tol=1e-9)
 
-        assert math.isclose(position.entry_net_credit, original_entry_net_credit + expected_net_credit, abs_tol=1e-9)
-        assert position.rolled_side == "call"
-        assert position.rolls_used == 1
+        # Both original legs are still there (so a replacement order can
+        # still find them by symbol), but position.legs/entry_net_credit/
+        # max_loss/profit_target_debit have all narrowed to the put side.
+        assert position.short_call.strike == 760.0
+        assert [leg.strike for leg in position.legs] == [760.0, 752.0]
+        assert math.isclose(position.entry_net_credit, put_credit, abs_tol=1e-9)
+        put_wing_width = position.short_put.strike - position.long_put.strike  # 8.0
+        assert math.isclose(position.max_loss, put_wing_width - put_credit, abs_tol=1e-9)
+        expected_round_trip_fees = fees.entry_fees(position.contracts, legs=4) + fees.exit_fees(position.contracts, legs=2)
+        assert math.isclose(position.round_trip_fees, expected_round_trip_fees, abs_tol=1e-9)
+        expected_target_debit = recompute_profit_target_debit(
+            put_credit, position.target_pct, position.multiplier, position.contracts, position.round_trip_fees,
+        )
+        assert position.profit_target_debit == expected_target_debit
 
-        call_wing_width = position.long_call.strike - position.short_call.strike  # 2.0
-        put_wing_width = position.short_put.strike - position.long_put.strike      # 8.0
-        expected_max_loss = max(call_wing_width - position.entry_net_credit,
-                                 put_wing_width - position.entry_net_credit)
-        assert math.isclose(position.max_loss, expected_max_loss, abs_tol=1e-9)
-
-    def test_rolls_the_put_side_leaves_call_side_untouched(self):
+    def test_flattening_put_side_leaves_call_side_open(self):
         executor, position = self._open_position()
-        chain = _base_chain()
-        roll = build_untested_side_roll(chain, side="put", short_target_delta=0.30, wing_target_delta=0.10)
-        old_quotes = {
+        quotes = {
             position.short_put.symbol: (0.10, 0.15),
             position.long_put.symbol: (0.01, 0.02),
         }
         with patch.object(coe, "EXECUTE_ORDERS", False):
-            executor.submit_untested_roll(position, roll, old_quotes)
+            executor.close_vertical(position, "put", quotes)
 
-        assert position.short_put.strike == 756.0
-        assert position.long_put.strike == 752.0
-        assert position.short_call.strike == 760.0
-        assert position.long_call.strike == 766.0
-        assert position.rolled_side == "put"
-        assert position.rolls_used == 1
+        assert position.flattened_side == "put"
+        assert [leg.strike for leg in position.legs] == [760.0, 766.0]
+        assert math.isclose(position.entry_net_credit, position.call_side_entry_credit, abs_tol=1e-9)
 
-    def test_paper_roll_never_calls_the_http_session(self):
+    def test_paper_flatten_never_calls_the_http_session(self):
         executor, position = self._open_position()
-        chain = _base_chain()
-        roll = build_untested_side_roll(chain, side="call", short_target_delta=0.30, wing_target_delta=0.10)
-        old_quotes = {position.short_call.symbol: (0.10, 0.15), position.long_call.symbol: (0.01, 0.02)}
+        quotes = {position.short_call.symbol: (0.10, 0.15), position.long_call.symbol: (0.01, 0.02)}
         executor._session = MagicMock()
         with patch.object(coe, "EXECUTE_ORDERS", False):
-            executor.submit_untested_roll(position, roll, old_quotes)
+            executor.close_vertical(position, "call", quotes)
         executor._session.post.assert_not_called()
 
 

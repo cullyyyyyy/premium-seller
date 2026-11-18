@@ -46,18 +46,23 @@ CONDOR_ENTRY_MINUTE = 0       # matches tastylive's own 0DTE iron fly research
 CONDOR_BACKSTOP_HOUR = 14     # force-close by this time regardless of P&L --
 CONDOR_BACKSTOP_MINUTE = 30   # never ride into the final-hour gamma/pin window
 
-# Defend: roll the untested side closer for extra credit when breakeven is
-# breached (confirmed), once per day; full close if the rolled side is
-# later breached too -- see config.py for the full rationale.
+# Defend: flatten the untested side (close just its own 2 legs) once it's
+# captured most of its own max profit when the other side's breakeven is
+# breached (confirmed); otherwise leave both sides open -- see config.py
+# for the full rationale.
 CONDOR_DEFEND_ENABLED = False
 CONDOR_DEFEND_CONFIRM_POLLS = 4
-CONDOR_ROLL_SHORT_TARGET_DELTA = 0.30
-CONDOR_MAX_UNTESTED_ROLLS_PER_DAY = 1
+CONDOR_DEFEND_CAPTURE_PCT = 0.90
 
 # Force-exit when VIX, after dipping below its own previous close post-entry,
 # recrosses back above it -- see config.py for the full rationale (2026-11-05
 # analysis). Defaults off here, same pattern as CONDOR_DEFEND_ENABLED above.
 CONDOR_VIX_RECROSS_EXIT_ENABLED = False
+
+# Consecutive polls required on each side of zero before the recross logic
+# counts it as real, not noise -- see config.py for the full rationale
+# (2026-11-10 false-trigger analysis). Same value as CONDOR_DEFEND_CONFIRM_POLLS.
+CONDOR_VIX_RECROSS_CONFIRM_POLLS = CONDOR_DEFEND_CONFIRM_POLLS
 
 # Skip entry entirely when VIX is already up this much (day-change vs its own
 # prior settled close) at the entry poll -- see config.py for the full

@@ -104,112 +104,127 @@ class TestEvaluateDefend:
         # entry_net_credit = (3.00+2.90) - (0.25+0.20) = 5.45
         # breakeven_lower = 760 - 5.45 = 754.55; breakeven_upper = 760 + 5.45 = 765.45
 
+    def _evaluate(self, position, spy_price, streaks, *, call_capture_pct=None, put_capture_pct=None,
+                  confirm_polls=4, capture_threshold=0.90):
+        return dl.evaluate_defend(
+            position, spy_price, streaks, confirm_polls=confirm_polls, capture_threshold=capture_threshold,
+            call_capture_pct=call_capture_pct, put_capture_pct=put_capture_pct,
+        )
+
     def test_no_action_inside_the_profit_zone(self):
         position = self._position()
         streaks = dl.DefendStreaks()
-        action, next_streaks = dl.evaluate_defend(
-            position, 760.0, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-        )
+        action, next_streaks = self._evaluate(position, 760.0, streaks)
         assert action is None
-        assert next_streaks == dl.DefendStreaks(0, 0, 0)
+        assert next_streaks == dl.DefendStreaks(0, 0)
 
     def test_single_breach_does_not_fire_before_confirm_polls(self):
         position = self._position()
         streaks = dl.DefendStreaks()
         for _ in range(3):
-            action, streaks = dl.evaluate_defend(
-                position, 750.0, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-            )
+            action, streaks = self._evaluate(position, 750.0, streaks, call_capture_pct=0.95)
             assert action is None
         assert streaks.put_breach_streak == 3
 
-    def test_put_breach_confirmed_for_four_polls_rolls_the_call_side(self):
+    def test_put_breach_confirmed_for_four_polls_flattens_the_call_side_when_captured_enough(self):
         position = self._position()
         streaks = dl.DefendStreaks()
         action = None
         for _ in range(4):
-            action, streaks = dl.evaluate_defend(
-                position, 750.0, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-            )
-        assert action == "roll_call"
+            action, streaks = self._evaluate(position, 750.0, streaks, call_capture_pct=0.95)
+        assert action == "flatten_call"
 
-    def test_call_breach_confirmed_for_four_polls_rolls_the_put_side(self):
+    def test_call_breach_confirmed_for_four_polls_flattens_the_put_side_when_captured_enough(self):
         position = self._position()
         streaks = dl.DefendStreaks()
         action = None
         for _ in range(4):
-            action, streaks = dl.evaluate_defend(
-                position, 770.0, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-            )
-        assert action == "roll_put"
+            action, streaks = self._evaluate(position, 770.0, streaks, put_capture_pct=0.95)
+        assert action == "flatten_put"
+
+    def test_breach_confirmed_but_capture_not_enough_returns_none(self):
+        """Core of the 2026-11-12 switch away from rolling: a confirmed
+        breach alone is no longer enough -- the untested side must
+        already have captured most of ITS OWN credit, or this just
+        leaves both sides open (ride the backstop/profit-target path,
+        same as if defend were off)."""
+        position = self._position()
+        streaks = dl.DefendStreaks()
+        action = None
+        for _ in range(4):
+            action, streaks = self._evaluate(position, 750.0, streaks, call_capture_pct=0.50)
+        assert action is None
+
+    def test_none_capture_pct_is_not_enough(self):
+        position = self._position()
+        streaks = dl.DefendStreaks()
+        action = None
+        for _ in range(4):
+            action, streaks = self._evaluate(position, 750.0, streaks, call_capture_pct=None)
+        assert action is None
 
     def test_streak_resets_if_price_recovers_before_confirming(self):
         position = self._position()
         streaks = dl.DefendStreaks()
         for _ in range(3):
-            _, streaks = dl.evaluate_defend(
-                position, 750.0, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-            )
+            _, streaks = self._evaluate(position, 750.0, streaks, call_capture_pct=0.95)
         assert streaks.put_breach_streak == 3
-        action, streaks = dl.evaluate_defend(
-            position, 760.0, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-        )
+        action, streaks = self._evaluate(position, 760.0, streaks, call_capture_pct=0.95)
         assert action is None
         assert streaks.put_breach_streak == 0
 
-    def test_no_roll_once_the_daily_cap_is_used(self):
-        position = self._position()
-        streaks = dl.DefendStreaks()
-        action = None
-        for _ in range(4):
-            action, streaks = dl.evaluate_defend(
-                position, 750.0, streaks, rolled_side=None, rolls_used=1, confirm_polls=4, max_rolls=1,
-            )
-        assert action is None
-
     def test_missing_price_is_a_no_op(self):
         position = self._position()
-        streaks = dl.DefendStreaks(2, 0, 0)
-        action, next_streaks = dl.evaluate_defend(
-            position, None, streaks, rolled_side=None, rolls_used=0, confirm_polls=4, max_rolls=1,
-        )
+        streaks = dl.DefendStreaks(2, 0)
+        action, next_streaks = self._evaluate(position, None, streaks, call_capture_pct=0.95)
         assert action is None
         assert next_streaks == streaks  # untouched, not reset
 
-    def test_rolled_side_only_watches_the_rolled_side_for_reversal(self):
-        """After a call-side roll, the new call breakeven is derived from
-        the ROLLED short_call.strike, not the stale single short_strike --
-        simulate the roll by replacing short_call directly, same shape
-        _finalize_untested_roll leaves the position in."""
+
+class TestSideCapturePct:
+    def _position(self):
+        chain = _base_chain()
+        result = build_iron_butterfly(chain)
+        executor = coe.CondorOrderExecutor(session_token="tok")
+        with patch.object(coe, "EXECUTE_ORDERS", False):
+            _, position = executor.submit_entry(result)
+        return position
+
+    def test_fully_decayed_side_is_near_100_pct_captured(self):
         position = self._position()
-        position.short_call = coe.CondorLegRecord(symbol="rolled_call", strike=764.0, entry_action="Sell to Open")
-        position.entry_net_credit = 7.05  # 5.45 original + 1.60 roll credit
-        # new call breakeven = 764 + 7.05 = 771.05
-        streaks = dl.DefendStreaks()
-        # Deep put-side move must NOT register at all once a side is rolled.
-        action, streaks = dl.evaluate_defend(
-            position, 700.0, streaks, rolled_side="call", rolls_used=1, confirm_polls=4, max_rolls=1,
-        )
-        assert action is None
-        assert streaks.rolled_side_breach_streak == 0
+        # call_side_entry_credit = 3.05 - 0.225 = 2.825 (mid-based, see _base_chain)
+        quotes = {
+            position.short_call.symbol: (0.01, 0.02),
+            position.long_call.symbol: (0.00, 0.01),
+        }
+        pct = dl._side_capture_pct(position, "call", quotes)
+        assert pct > 0.99
 
-        action = None
-        for _ in range(4):
-            action, streaks = dl.evaluate_defend(
-                position, 772.0, streaks, rolled_side="call", rolls_used=1, confirm_polls=4, max_rolls=1,
-            )
-        assert action == "close_reversal"
+    def test_untouched_side_is_near_zero_pct_captured(self):
+        position = self._position()
+        quotes = {
+            position.short_call.symbol: (3.00, 3.10),
+            position.long_call.symbol: (0.20, 0.25),
+        }
+        pct = dl._side_capture_pct(position, "call", quotes)
+        assert math.isclose(pct, 0.0, abs_tol=0.02)
+
+    def test_missing_quote_is_none(self):
+        position = self._position()
+        pct = dl._side_capture_pct(position, "call", quotes={})
+        assert pct is None
+
+    def test_none_quotes_is_none(self):
+        position = self._position()
+        assert dl._side_capture_pct(position, "call", None) is None
 
 
-class TestAttemptUntestedRoll:
-    """build_untested_side_roll/select_untested_short are unit-tested
-    directly in test_iron_butterfly.py (the opposite_strike guard
-    itself). These exercise _attempt_untested_roll's own job: forwarding
-    the tested side's open short strike as opposite_strike, and -- the
-    behavior added after the Nov 5 2026 incident -- force-closing the
-    WHOLE position when no safe roll strike exists, instead of leaving
-    a structure that's already breached its untested side unrolled and
-    unwatched until the backstop time."""
+class TestAttemptFlatten:
+    """_attempt_flatten's own job: fetch a fresh quote and forward to
+    executor.close_vertical, alerting on either outcome. Unlike the old
+    roll attempt, there's no "no valid strike" failure mode here -- that
+    entire class of failure went away with the roll itself (see
+    config.py's CONDOR_DEFEND_ENABLED comment)."""
 
     def _position(self):
         chain = _base_chain()
@@ -219,76 +234,46 @@ class TestAttemptUntestedRoll:
             _, position = executor.submit_entry(result)
         return position
 
-    def test_build_failure_force_closes_the_position(self, mock_alerts):
+    def test_quote_fetch_failure_alerts_and_does_not_call_the_executor(self, mock_alerts):
+        position = self._position()
+        executor = MagicMock()
+        with patch("daily_loop.fetch_leg_quotes", return_value=None):
+            dl._attempt_flatten(executor, MagicMock(), position, "call", "SPY")
+
+        executor.close_vertical.assert_not_called()
+        mock_alerts.notify_flatten_failed.assert_called_once()
+
+    def test_successful_flatten_forwards_to_close_vertical_and_alerts_success(self, mock_alerts):
         position = self._position()
         executor = MagicMock()
 
-        def _fake_submit_exit(pos, quotes, *, reason):
-            pos.status = "closed"
-            pos.exit_debit = 9.99
-            pos.exit_reason = reason
-            pos.realized_pnl = -123.45
-            return coe.OrderResult(status=coe.OrderStatus.FILLED, net_price=9.99,
+        def _fake_close_vertical(pos, side, quotes):
+            pos.flattened_side = side
+            pos.flatten_debit = 0.14
+            pos.flatten_pnl = 268.22
+            pos.profit_target_debit = 0.50
+            return coe.OrderResult(status=coe.OrderStatus.FILLED, net_price=0.14,
                                     filled_quantity=pos.contracts)
-        executor.submit_exit.side_effect = _fake_submit_exit
+        executor.close_vertical.side_effect = _fake_close_vertical
 
-        with patch("daily_loop.fetch_chain_snapshot", return_value=_base_chain()), \
-             patch("daily_loop.build_untested_side_roll",
-                   side_effect=dl.IronButterflyError("no call strike clears the open short put")), \
-             patch("daily_loop.fetch_leg_quotes", return_value={"x": (1.0, 1.1)}):
-            closed = dl._attempt_untested_roll(executor, MagicMock(), position, "call", "SPY")
+        quotes = {"x": (1.0, 1.1)}
+        with patch("daily_loop.fetch_leg_quotes", return_value=quotes):
+            dl._attempt_flatten(executor, MagicMock(), position, "call", "SPY")
 
-        assert closed is True
-        assert position.status == "closed"
-        executor.submit_exit.assert_called_once()
-        _, kwargs = executor.submit_exit.call_args
-        assert kwargs["reason"] == "roll_unavailable"
-        mock_alerts.notify_exit.assert_called_once()
-        mock_alerts.notify_roll_failed.assert_called_once()
+        executor.close_vertical.assert_called_once_with(position, "call", quotes)
+        mock_alerts.notify_flatten.assert_called_once()
+        mock_alerts.notify_flatten_failed.assert_not_called()
 
-    def test_build_failure_but_close_order_does_not_fill_returns_false(self, mock_alerts):
-        """submit_exit left the position open (order didn't fill) -- the
-        caller must NOT treat this as closed and stop monitoring."""
+    def test_unfilled_flatten_alerts_failure_not_success(self, mock_alerts):
         position = self._position()
         executor = MagicMock()
-        executor.submit_exit.return_value = coe.OrderResult(status=coe.OrderStatus.TIMEOUT)
+        executor.close_vertical.return_value = coe.OrderResult(status=coe.OrderStatus.TIMEOUT, message="no fill")
 
-        with patch("daily_loop.fetch_chain_snapshot", return_value=_base_chain()), \
-             patch("daily_loop.build_untested_side_roll",
-                   side_effect=dl.IronButterflyError("no call strike clears the open short put")), \
-             patch("daily_loop.fetch_leg_quotes", return_value={"x": (1.0, 1.1)}):
-            closed = dl._attempt_untested_roll(executor, MagicMock(), position, "call", "SPY")
+        with patch("daily_loop.fetch_leg_quotes", return_value={"x": (1.0, 1.1)}):
+            dl._attempt_flatten(executor, MagicMock(), position, "put", "SPY")
 
-        assert closed is False
-        assert position.status == "open"
-        mock_alerts.notify_exit.assert_not_called()
-
-    def test_opposite_strike_passed_through_as_the_tested_sides_open_short_strike(self, mock_alerts):
-        position = self._position()
-        executor = MagicMock()
-        executor.submit_untested_roll.return_value = coe.OrderResult(
-            status=coe.OrderStatus.FILLED, net_price=1.0, filled_quantity=position.contracts)
-
-        with patch("daily_loop.fetch_chain_snapshot", return_value=_base_chain()), \
-             patch("daily_loop.build_untested_side_roll") as mock_build, \
-             patch("daily_loop.fetch_leg_quotes", return_value={"x": (1.0, 1.1)}):
-            mock_build.return_value = MagicMock(new_short_strike=764.0, new_wing_strike=766.0)
-            closed = dl._attempt_untested_roll(executor, MagicMock(), position, "call", "SPY")
-
-        assert closed is False
-        _, kwargs = mock_build.call_args
-        assert kwargs["opposite_strike"] == position.short_put.strike
-
-        executor_put_side = MagicMock()
-        executor_put_side.submit_untested_roll.return_value = coe.OrderResult(
-            status=coe.OrderStatus.FILLED, net_price=1.0, filled_quantity=position.contracts)
-        with patch("daily_loop.fetch_chain_snapshot", return_value=_base_chain()), \
-             patch("daily_loop.build_untested_side_roll") as mock_build_put, \
-             patch("daily_loop.fetch_leg_quotes", return_value={"x": (1.0, 1.1)}):
-            mock_build_put.return_value = MagicMock(new_short_strike=756.0, new_wing_strike=752.0)
-            dl._attempt_untested_roll(executor_put_side, MagicMock(), position, "put", "SPY")
-        _, kwargs_put = mock_build_put.call_args
-        assert kwargs_put["opposite_strike"] == position.short_call.strike
+        mock_alerts.notify_flatten.assert_not_called()
+        mock_alerts.notify_flatten_failed.assert_called_once()
 
 
 class TestContractsFor:
@@ -685,7 +670,14 @@ class TestRunDayVixRecrossExit:
         )
         return executor
 
-    def test_fires_only_after_a_negative_poll_is_followed_by_a_positive_one(self, mock_alerts):
+    def test_fires_only_after_a_confirmed_dip_is_followed_by_a_confirmed_recross(self, mock_alerts):
+        """CONDOR_VIX_RECROSS_CONFIRM_POLLS consecutive polls are required on
+        each side (patched to 2 here to keep the fixture short) -- a single
+        poll on either side must NOT be enough. See the noise-rejection test
+        below for the 2026-11-10 false-trigger this debounce was added for.
+        Quotes are priced near-worthless (debit ~0.0, well under the 5.6
+        entry_net_credit) so the 2026-11-18 profitability gate is satisfied --
+        see the loss-case test below for what happens when it isn't."""
         chain = _base_chain()
         position = self._entered_position(chain)
         executor = self._mock_live_executor(position)
@@ -704,19 +696,19 @@ class TestRunDayVixRecrossExit:
         executor.submit_exit = MagicMock(side_effect=fake_submit_exit)
 
         options_chain = MagicMock()
-        # Leading 0.0 is the separate entry-time fetch (run_day's VIX
-        # entry-skip check, CONDOR_VIX_ENTRY_SKIP_THRESHOLD_PCT) --
-        # below threshold, so entry proceeds and the monitoring loop
-        # gets to its own sequence unchanged: Poll 1 VIX down -2% (dip
-        # recorded), Poll 2 VIX up +1% -- the recross. If it fires
-        # here, the loop must never reach a 3rd poll.
-        options_chain.get_vix_day_change_pct.side_effect = [0.0, -2.0, 1.0, 999.0]
+        # Leading 0.0 is the separate entry-time fetch. Then: 2 consecutive
+        # negative polls (confirms the dip), 2 consecutive positive polls
+        # (confirms the recross on the 2nd one). If it fires here, the loop
+        # must never reach a 5th poll.
+        options_chain.get_vix_day_change_pct.side_effect = [0.0, -2.0, -1.5, 1.0, 0.8, 999.0]
+        profitable_quotes = {leg.symbol: (0.05, 0.05) for leg in position.legs}
 
         with patch("daily_loop.wait_until", new=_instant_wait), \
              patch("daily_loop.fetch_chain_snapshot", return_value=chain), \
-             patch("daily_loop.fetch_leg_quotes", return_value={}), \
+             patch("daily_loop.fetch_leg_quotes", return_value=profitable_quotes), \
              patch("daily_loop.should_exit", return_value=None), \
              patch("daily_loop.CONDOR_DEFEND_ENABLED", False), \
+             patch("daily_loop.CONDOR_VIX_RECROSS_CONFIRM_POLLS", 2), \
              patch("daily_loop.CONDOR_BACKSTOP_HOUR", 23), \
              patch("daily_loop.CONDOR_BACKSTOP_MINUTE", 59), \
              patch("daily_loop.asyncio.sleep", new=_fast_sleep):
@@ -727,6 +719,105 @@ class TestRunDayVixRecrossExit:
         assert executor.submit_exit.call_args.kwargs["reason"] == "vix_recross"
         assert result_position.status == "closed"
         assert result_position.realized_pnl == 165.0
+
+    def test_does_not_fire_while_the_position_is_currently_losing(self, mock_alerts):
+        """Regression test for the real 2026-11-18 incident: VIX dipped at
+        entry and later recrossed positive right as SPY dropped toward the
+        put wing (position at -$204 on the mark). The un-gated recross forced
+        a -$199.96 realized loss; post-close hindsight showed SPY reverted and
+        the position would have been +$100 to +$128 for most of the rest of
+        the session. Same VIX sequence as the fires-test above, but quotes
+        price the position as a large loss (debit 15.9, over the 5.6
+        entry_net_credit) -- the recross must NOT fire."""
+        chain = _base_chain()
+        position = self._entered_position(chain)
+        executor = self._mock_live_executor(position)
+        executor.submit_resting_exit.return_value = coe.OrderResult(
+            status=coe.OrderStatus.SUBMITTED, order_id="resting-1",
+        )
+        executor.poll_resting_exit.return_value = False  # never fills
+
+        options_chain = MagicMock()
+        vix_values = [0.0, -2.0, -1.5, 1.0, 0.8]
+        options_chain.get_vix_day_change_pct.side_effect = vix_values
+        losing_quotes = {}
+        for leg in position.legs:
+            losing_quotes[leg.symbol] = (8.0, 8.0) if leg.entry_action == "Sell to Open" else (0.05, 0.05)
+
+        class _Bail(Exception):
+            pass
+
+        call_count = {"n": 0}
+
+        async def _sleep_then_stop(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] >= len(vix_values) - 1:
+                raise _Bail  # bail out after exhausting the side_effect list
+            return None
+
+        with patch("daily_loop.wait_until", new=_instant_wait), \
+             patch("daily_loop.fetch_chain_snapshot", return_value=chain), \
+             patch("daily_loop.fetch_leg_quotes", return_value=losing_quotes), \
+             patch("daily_loop.should_exit", return_value=None), \
+             patch("daily_loop.CONDOR_DEFEND_ENABLED", False), \
+             patch("daily_loop.CONDOR_VIX_RECROSS_CONFIRM_POLLS", 2), \
+             patch("daily_loop.CONDOR_BACKSTOP_HOUR", 23), \
+             patch("daily_loop.CONDOR_BACKSTOP_MINUTE", 59), \
+             patch("daily_loop.asyncio.sleep", new=_sleep_then_stop), \
+             pytest.raises(_Bail):
+            asyncio.run(dl.run_day(options_chain, executor))
+
+        executor.cancel_resting_exit.assert_not_called()
+        executor.submit_exit.assert_not_called()
+
+    def test_single_noisy_poll_each_side_of_zero_does_not_trigger_a_false_recross(self, mock_alerts):
+        """Regression test for the real 2026-11-10 false trigger: VIX's own
+        print wobbled a few hundredths of a percent around zero right after
+        entry (-0.10%, +0.10%, -0.30%, -0.35%, +0.30%, ...), never a real
+        sustained dip, and the un-debounced sign check force-closed the
+        position on that noise for a real -$5.96 loss. With the default
+        CONDOR_VIX_RECROSS_CONFIRM_POLLS (4), this exact sequence (max 3
+        consecutive negative polls) must never confirm a dip, so the recross
+        must never fire."""
+        chain = _base_chain()
+        position = self._entered_position(chain)
+        executor = self._mock_live_executor(position)
+        executor.submit_resting_exit.return_value = coe.OrderResult(
+            status=coe.OrderStatus.SUBMITTED, order_id="resting-1",
+        )
+        executor.poll_resting_exit.return_value = False
+
+        options_chain = MagicMock()
+        # Leading 1.0 is the entry-time fetch (below the 5.0 skip threshold).
+        # The rest is the real 2026-11-10 intraday_pnl.jsonl vix_change_pct
+        # sequence, verbatim.
+        vix_values = [1.0, 1.26, 0.75, 0.25, -0.10, 0.10, -0.10, -0.30, -0.35, 0.30]
+        options_chain.get_vix_day_change_pct.side_effect = vix_values
+
+        class _Bail(Exception):
+            pass
+
+        call_count = {"n": 0}
+
+        async def _sleep_then_stop(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] >= len(vix_values) - 1:
+                raise _Bail  # bail out after exhausting the side_effect list
+            return None
+
+        with patch("daily_loop.wait_until", new=_instant_wait), \
+             patch("daily_loop.fetch_chain_snapshot", return_value=chain), \
+             patch("daily_loop.fetch_leg_quotes", return_value={}), \
+             patch("daily_loop.should_exit", return_value=None), \
+             patch("daily_loop.CONDOR_DEFEND_ENABLED", False), \
+             patch("daily_loop.CONDOR_BACKSTOP_HOUR", 23), \
+             patch("daily_loop.CONDOR_BACKSTOP_MINUTE", 59), \
+             patch("daily_loop.asyncio.sleep", new=_sleep_then_stop), \
+             pytest.raises(_Bail):
+            asyncio.run(dl.run_day(options_chain, executor))
+
+        executor.cancel_resting_exit.assert_not_called()
+        executor.submit_exit.assert_not_called()
 
     def test_never_fires_if_vix_is_already_positive_at_entry(self, mock_alerts):
         """2026-10-30 and 2026-11-05 live: VIX was already above its prior

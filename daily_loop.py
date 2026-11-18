@@ -37,14 +37,14 @@ from config import (
     CONDOR_ENTRY_HOUR, CONDOR_ENTRY_MINUTE,
     CONDOR_BACKSTOP_HOUR, CONDOR_BACKSTOP_MINUTE,
     CONDOR_WING_TARGET_DELTA, CONDOR_PROFIT_TARGET_PCT,
-    CONDOR_DEFEND_ENABLED, CONDOR_DEFEND_CONFIRM_POLLS,
-    CONDOR_ROLL_SHORT_TARGET_DELTA, CONDOR_MAX_UNTESTED_ROLLS_PER_DAY,
+    CONDOR_DEFEND_ENABLED, CONDOR_DEFEND_CONFIRM_POLLS, CONDOR_DEFEND_CAPTURE_PCT,
     CONDOR_VIX_RECROSS_EXIT_ENABLED, CONDOR_VIX_ENTRY_SKIP_THRESHOLD_PCT,
+    CONDOR_VIX_RECROSS_CONFIRM_POLLS,
     CAPITAL_PER_SYMBOL, MAX_TRADE_CAPITAL_PCT, SYMBOL,
     MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
 )
 from iron_butterfly import (
-    build_iron_butterfly, build_untested_side_roll, fetch_chain_snapshot, IronButterflyError,
+    build_iron_butterfly, fetch_chain_snapshot, IronButterflyError,
 )
 from condor_order_executor import (
     CondorOrderExecutor, CondorPosition, OrderStatus, mid_debit_to_close, fetch_leg_quotes,
@@ -93,129 +93,105 @@ class DefendStreaks:
     contracts_for elsewhere in this module."""
     put_breach_streak: int = 0
     call_breach_streak: int = 0
-    rolled_side_breach_streak: int = 0
 
 
 def evaluate_defend(position: CondorPosition, spy_price: Optional[float], streaks: DefendStreaks,
-                     *, rolled_side: Optional[str], rolls_used: int,
-                     confirm_polls: int, max_rolls: int) -> Tuple[Optional[str], DefendStreaks]:
+                     *, confirm_polls: int, capture_threshold: float,
+                     call_capture_pct: Optional[float], put_capture_pct: Optional[float],
+                     ) -> Tuple[Optional[str], DefendStreaks]:
     """Pure decision function (same style as should_exit/contracts_for):
-    returns ("roll_call" | "roll_put" | "close_reversal" | None, next_streaks).
+    returns ("flatten_call" | "flatten_put" | None, next_streaks).
 
-    rolled_side/rolls_used are the CALLER's responsibility to track and
-    pass in -- they only change on a CONFIRMED successful roll order, not
-    as a pure function of price, so they don't belong in the (pure)
-    DefendStreaks the way the poll-to-poll breach counters do. A roll
-    attempt that fails to fill must not have already committed to "this
-    position has been rolled."
+    On a confirmed breach of one side (put_next/call_next >= confirm_polls,
+    same debounce as before), the UNTESTED side is flattened -- closed on
+    its own, 2 legs -- but ONLY if it has already captured >= capture_threshold
+    of its own planning-time credit (call_capture_pct/put_capture_pct,
+    computed by the caller from a live quote -- this stays a pure function
+    and doesn't fetch anything itself). Otherwise this returns None and
+    the position just rides as a whole on the ordinary should_exit path,
+    same as if CONDOR_DEFEND_ENABLED were off.
 
-    Each side's breakeven is computed from that side's OWN current short
-    strike (position.short_call.strike / position.short_put.strike), not
-    position.short_strike (the original ATM entry strike) -- these differ
-    once a roll moves one side's short strike (the structure becomes an
-    asymmetric iron condor, not a true butterfly, on whichever side
-    rolled). Pre-roll the two are identical, so this is correct either way.
+    This replaces rolling the untested side closer (retired 2026-11-12):
+    confirmed against two real trades (2026-11-11, 2026-11-12) that on a
+    shared-strike iron butterfly, the roll's own anti-crossing guard left
+    no safe strike to roll to once breakeven was actually breached, so it
+    always degenerated into closing the whole position anyway. Flattening
+    only the side that's already near its own max profit, and leaving the
+    tested side open on its own betting on a reversion before backstop,
+    is the adjustment that actually has room to work on this structure
+    (user 2026-11-12: "you close the position that's like at 100% profit
+    and hope the other one mean reverts").
 
-    Once a side has been rolled (rolled_side is not None), this ONLY
-    watches that rolled side for a re-breach -- per user 2026-10-30
-    ("If the SPY reverses and tests the opposite side, close it
-    completely"), there is no second roll, just a full close."""
+    Each side's breakeven is computed from position.short_call.strike/
+    position.short_put.strike directly, so this still reads correctly
+    even if called again later for whatever reason."""
     if spy_price is None:
         return None, streaks
 
     put_breakeven = position.short_put.strike - position.entry_net_credit
     call_breakeven = position.short_call.strike + position.entry_net_credit
 
-    if rolled_side is not None:
-        breached = (spy_price >= call_breakeven) if rolled_side == "call" else (spy_price <= put_breakeven)
-        next_streak = streaks.rolled_side_breach_streak + 1 if breached else 0
-        action = "close_reversal" if next_streak >= confirm_polls else None
-        return action, DefendStreaks(streaks.put_breach_streak, streaks.call_breach_streak, next_streak)
-
     put_next = streaks.put_breach_streak + 1 if spy_price <= put_breakeven else 0
     call_next = streaks.call_breach_streak + 1 if spy_price >= call_breakeven else 0
-    next_streaks = DefendStreaks(put_next, call_next, streaks.rolled_side_breach_streak)
+    next_streaks = DefendStreaks(put_next, call_next)
 
-    if rolls_used >= max_rolls:
-        return None, next_streaks
-    if put_next >= confirm_polls:
-        return "roll_call", next_streaks   # put side tested -> roll the untested CALL side closer
-    if call_next >= confirm_polls:
-        return "roll_put", next_streaks    # call side tested -> roll the untested PUT side closer
+    if put_next >= confirm_polls and call_capture_pct is not None and call_capture_pct >= capture_threshold:
+        return "flatten_call", next_streaks   # put side tested -> flatten the untested CALL side
+    if call_next >= confirm_polls and put_capture_pct is not None and put_capture_pct >= capture_threshold:
+        return "flatten_put", next_streaks    # call side tested -> flatten the untested PUT side
     return None, next_streaks
 
 
-def _attempt_untested_roll(executor: CondorOrderExecutor, options_chain, position: CondorPosition,
-                            side: str, symbol: str) -> bool:
-    """Fetch a fresh chain, build the new closer spread for `side` (the
-    untested side), and submit the 4-leg roll. Best-effort: a quotes
-    fetch failure or an unfilled roll order is logged and alerted but
-    never raises -- should_exit()'s existing profit-target/backstop
-    path is the real safety net regardless of whether this succeeds,
-    and a missed roll just means defending didn't happen this time, not
-    that the position is unmanaged.
+def _side_capture_pct(position: CondorPosition, side: str,
+                       quotes: Optional[Dict[str, Tuple[float, float]]]) -> Optional[float]:
+    """How much of `side`'s OWN planning-time credit (call_side_entry_credit/
+    put_side_entry_credit) has already been captured, as a fraction --
+    1.0 means it could be closed for zero debit right now, 0.0 means it's
+    worth exactly what it was sold for. None if there's no quote to
+    evaluate it with. Only meaningful pre-flatten, while both sides'
+    legs/quotes are still available (position.legs/fetch_leg_quotes both
+    narrow to one side once flattened_side is set)."""
+    short_leg = position.short_call if side == "call" else position.short_put
+    wing_leg = position.long_call if side == "call" else position.long_put
+    entry_credit = position.call_side_entry_credit if side == "call" else position.put_side_entry_credit
+    if quotes is None or entry_credit <= 0:
+        return None
+    if short_leg.symbol not in quotes or wing_leg.symbol not in quotes:
+        return None
+    short_bid, short_ask = quotes[short_leg.symbol]
+    wing_bid, wing_ask = quotes[wing_leg.symbol]
+    mid_debit = (short_bid + short_ask) / 2.0 - (wing_bid + wing_ask) / 2.0
+    return (entry_credit - mid_debit) / entry_credit
 
-    The one failure that's NOT left for the backstop to catch later is
-    build_untested_side_roll() refusing to build a roll at all (no
-    strike clears both the delta target and the tested side's own open
-    short strike -- see its opposite_strike guard, added after the
-    Nov 5 2026 incident where a call-side roll landed UNDER the open
-    short put). If there's no safe strike to roll to, there's no
-    partial defense available either, so this closes the WHOLE position
-    immediately (reason="roll_unavailable") rather than leaving a
-    structure that's already breached its untested side to sit
-    unrolled and unwatched until the backstop time arrives.
 
-    Returns True if this call force-closed the position (caller must
-    treat it exactly like any other exit and stop monitoring), False if
-    the position is still open (rolled, or roll attempted/skipped and
-    left for the next poll)."""
-    try:
-        chain = fetch_chain_snapshot(options_chain, symbol)
-        opposite_strike = position.short_put.strike if side == "call" else position.short_call.strike
-        roll = build_untested_side_roll(
-            chain, side=side,
-            short_target_delta=CONDOR_ROLL_SHORT_TARGET_DELTA,
-            wing_target_delta=CONDOR_WING_TARGET_DELTA,
-            opposite_strike=opposite_strike,
-        )
-    except IronButterflyError as e:
-        logger.error("[CONDOR] Could not build untested-side roll (%s): %s -- closing position instead",
-                      side, e)
-        _alerts.notify_roll_failed(side, str(e))
-        quotes = fetch_leg_quotes(options_chain, position)
-        executor.submit_exit(position, quotes or {}, reason="roll_unavailable")
-        if position.status == "closed":
-            logger.info(
-                "[CONDOR] Exited (roll_unavailable): debit=$%.2f/share, realized P&L=$%.2f",
-                position.exit_debit, position.realized_pnl,
-            )
-            _alerts.notify_exit("roll_unavailable", position.exit_debit, position.realized_pnl,
-                                position.entry_net_credit * position.multiplier * position.contracts)
-            return True
-        logger.error("[CONDOR] Forced close after roll_unavailable (%s) did not fill -- position still open", side)
-        return False
+def _attempt_flatten(executor: CondorOrderExecutor, options_chain, position: CondorPosition,
+                      side: str, symbol: str) -> None:
+    """Fetch a fresh quote and close just `side`'s 2 legs. Best-effort:
+    a quotes fetch failure or an unfilled flatten order is logged and
+    alerted but never raises -- should_exit()'s existing profit-target/
+    backstop path is the real safety net regardless of whether this
+    succeeds, and a missed flatten just means it'll be retried (or
+    re-evaluated) next poll, not that the position is unmanaged. Unlike
+    the old roll attempt, there's no "no valid strike" failure mode here
+    to force a full close over -- closing 2 already-identified legs at
+    whatever they're quoted at always succeeds or just doesn't fill yet."""
+    quotes = fetch_leg_quotes(options_chain, position)
+    if quotes is None:
+        logger.error("[CONDOR] Flatten (%s) aborted: could not fetch current quotes on existing legs", side)
+        _alerts.notify_flatten_failed(side, "could not fetch current quotes on existing legs")
+        return
 
-    old_quotes = fetch_leg_quotes(options_chain, position)
-    if old_quotes is None:
-        logger.error("[CONDOR] Untested-side roll (%s) aborted: could not fetch current quotes on existing legs", side)
-        _alerts.notify_roll_failed(side, "could not fetch current quotes on existing legs")
-        return False
-
-    result = executor.submit_untested_roll(position, roll, old_quotes)
+    result = executor.close_vertical(position, side, quotes)
     if result.status == OrderStatus.FILLED:
         logger.info(
-            "[CONDOR] Rolled untested %s side | new short $%.2f, new wing $%.2f | "
-            "roll net credit $%.2f/share | total net credit now $%.2f/share",
-            side, roll.new_short_strike, roll.new_wing_strike, result.net_price, position.entry_net_credit,
+            "[CONDOR] Flattened untested %s side | debit=$%.2f/share | banked P&L=$%.2f | "
+            "remaining side's new profit target $%.2f/share",
+            side, position.flatten_debit, position.flatten_pnl, position.profit_target_debit,
         )
-        _alerts.notify_roll(side, roll.new_short_strike, roll.new_wing_strike,
-                             result.net_price, position.entry_net_credit)
-        return False
+        _alerts.notify_flatten(side, position.flatten_debit, position.flatten_pnl)
     else:
-        logger.warning("[CONDOR] Untested-side roll (%s) order did not fill: %s", side, result.message)
-        _alerts.notify_roll_failed(side, result.message)
-        return False
+        logger.warning("[CONDOR] Flatten (%s) order did not fill: %s", side, result.message)
+        _alerts.notify_flatten_failed(side, result.message)
 
 
 def _rest_profit_target_order(executor: CondorOrderExecutor, position: CondorPosition) -> Optional[str]:
@@ -348,6 +324,16 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
     # 2026-11-05 (+26.67%) both never dipped and rode to a backstop loss;
     # neither would have passed this filter. See config.py.
     entry_vix_change_pct = options_chain.get_vix_day_change_pct()
+    # Logged unconditionally -- previously this was only ever visible in a
+    # log line when it triggered the skip below; on a normal entry it was
+    # computed and then silently discarded, so there was no record of where
+    # VIX actually stood at entry to check against later (see 2026-11-10:
+    # asked whether VIX was still up ~5% at entry, had no logged number to
+    # check it against).
+    logger.info(
+        "[CONDOR] VIX at entry poll: %s",
+        f"{entry_vix_change_pct:.2f}% vs prior close" if entry_vix_change_pct is not None else "unavailable",
+    )
     if entry_vix_change_pct is not None and entry_vix_change_pct >= CONDOR_VIX_ENTRY_SKIP_THRESHOLD_PCT:
         logger.info(
             "[CONDOR] Skipping entry -- VIX already up %.2f%% at entry (threshold %.2f%%)",
@@ -415,12 +401,21 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
     resting_order_id = _rest_profit_target_order(executor, position)
 
     defend_streaks = DefendStreaks()
-    vix_dipped_negative = False  # tracks whether VIX has been seen BELOW its own
-    # prior close at any poll since entry -- a later recross above that same
-    # level is only the signal found live 2026-11-02 (VIX recovering off a dip)
-    # if it actually dipped first; a day where VIX is already elevated at
+    vix_dipped_negative = False  # tracks whether VIX has been CONFIRMED below its
+    # own prior close at some poll since entry -- a later confirmed recross above
+    # that same level is only the signal found live 2026-11-02 (VIX recovering off
+    # a dip) if it actually dipped first; a day where VIX is already elevated at
     # entry (2026-10-30, 2026-11-05) never sets this, so vix_recross_exit
     # below can never fire for that day -- matches the backtest exactly.
+    #
+    # "Confirmed" means CONDOR_VIX_RECROSS_CONFIRM_POLLS consecutive polls on
+    # one side of zero, not a single poll -- found live 2026-11-10: vix_change_pct
+    # wobbled -0.10%/+0.10%/-0.35% around zero for a few polls right after entry
+    # (VIX's own print is noisy right after the open) and the un-debounced
+    # single-poll sign check force-closed the position on that noise, not a
+    # real dip-and-recover, for a -$5.96 loss.
+    vix_negative_poll_streak = 0
+    vix_positive_poll_streak_since_dip = 0
 
     while True:
         now = datetime.now(et_tz)
@@ -436,66 +431,90 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
         vix_recross_exit = False
         if CONDOR_VIX_RECROSS_EXIT_ENABLED and vix_change_pct is not None:
             if vix_change_pct <= 0:
-                vix_dipped_negative = True
-            elif vix_dipped_negative:
-                vix_recross_exit = True
+                vix_negative_poll_streak += 1
+                vix_positive_poll_streak_since_dip = 0
+                if vix_negative_poll_streak >= CONDOR_VIX_RECROSS_CONFIRM_POLLS:
+                    vix_dipped_negative = True
+            else:
+                vix_negative_poll_streak = 0
+                if vix_dipped_negative:
+                    vix_positive_poll_streak_since_dip += 1
+                    if (vix_positive_poll_streak_since_dip >= CONDOR_VIX_RECROSS_CONFIRM_POLLS
+                            and current_debit is not None
+                            and current_debit < position.entry_net_credit):
+                        # Gate added 2026-11-18: the recross itself is only ever
+                        # the SIGNAL this was built around (2026-11-02, position
+                        # already +$165 when it fired, protecting that gain from
+                        # a backstop-time loss) -- it was never meant to force an
+                        # exit on its own. Live 2026-11-18 it fired at -$204 on
+                        # the mark (SPY had just dropped toward the put wing) and
+                        # locked in a -$199.96 loss; post-close hindsight showed
+                        # SPY reverted and the position would have been +$100 to
+                        # +$128 for most of the rest of the session. Requiring
+                        # current_debit < entry_net_credit (i.e. closing now is
+                        # actually a gain) keeps the exit doing only what it was
+                        # designed to do. current_debit is None whenever the quote
+                        # fetch fails that poll -- no data means no forced exit;
+                        # the backstop is still the real safety net either way.
+                        vix_recross_exit = True
 
-        defend_action = None
-        if CONDOR_DEFEND_ENABLED:
+        if CONDOR_DEFEND_ENABLED and position.flattened_side is None:
             spy_price = options_chain.get_equity_mid_price(symbol)
+            call_capture_pct = _side_capture_pct(position, "call", quotes)
+            put_capture_pct = _side_capture_pct(position, "put", quotes)
             defend_action, defend_streaks = evaluate_defend(
                 position, spy_price, defend_streaks,
-                rolled_side=position.rolled_side, rolls_used=position.rolls_used,
-                confirm_polls=CONDOR_DEFEND_CONFIRM_POLLS, max_rolls=CONDOR_MAX_UNTESTED_ROLLS_PER_DAY,
+                confirm_polls=CONDOR_DEFEND_CONFIRM_POLLS, capture_threshold=CONDOR_DEFEND_CAPTURE_PCT,
+                call_capture_pct=call_capture_pct, put_capture_pct=put_capture_pct,
             )
-            if defend_action in ("roll_call", "roll_put"):
+            if defend_action in ("flatten_call", "flatten_put"):
                 # The resting profit-target order (if any) already holds a
                 # closing order against all 4 current legs, including the
-                # short leg this roll needs to close -- the broker rejects
-                # the roll's own closing leg with cannot_close_against_more_
-                # than_existing_position until that's cancelled. Found live
-                # 2026-11-05: every roll attempt failed identically, forever,
-                # because this cancel was missing (the backstop/close_reversal
-                # path below already does this correctly).
-                can_attempt_roll = True
+                # 2 legs this flatten needs to close -- the broker rejects
+                # the flatten's own closing legs with cannot_close_against_
+                # more_than_existing_position until that's cancelled. Same
+                # issue the old roll attempt hit (found live 2026-11-05).
+                side = "call" if defend_action == "flatten_call" else "put"
+                can_attempt_flatten = True
                 if resting_order_id is not None:
                     if executor.cancel_resting_exit(resting_order_id):
                         logger.info(
-                            "[CONDOR] Cancelled resting profit-target order %s before untested-side roll attempt (%s)",
-                            resting_order_id, defend_action,
+                            "[CONDOR] Cancelled resting profit-target order %s before flattening untested %s side",
+                            resting_order_id, side,
                         )
                         resting_order_id = None
                     else:
                         logger.error(
-                            "[CONDOR] Could not cancel resting profit-target order %s -- skipping roll "
+                            "[CONDOR] Could not cancel resting profit-target order %s -- skipping flatten "
                             "attempt this cycle, it would only collide with the still-open closing order",
                             resting_order_id,
                         )
-                        can_attempt_roll = False
-                if can_attempt_roll:
-                    closed = _attempt_untested_roll(executor, options_chain, position,
-                                                     "call" if defend_action == "roll_call" else "put", symbol)
-                    if closed:
-                        return position
+                        can_attempt_flatten = False
+                if can_attempt_flatten:
+                    _attempt_flatten(executor, options_chain, position, side, symbol)
+                    if position.flattened_side is not None:
+                        # entry_net_credit/max_loss just shrank to the remaining
+                        # side alone (see CondorOrderExecutor._finalize_flatten) --
+                        # the backstop price ceiling has to shrink with it.
+                        backstop_price_ceiling = position.entry_net_credit + position.max_loss
                     resting_order_id = _rest_profit_target_order(executor, position)
 
         if resting_order_id is not None:
             if executor.poll_resting_exit(position, resting_order_id, reason="profit_target"):
                 logger.info(
-                    "[CONDOR] Exited (profit_target, resting order): debit=$%.2f/share, realized P&L=$%.2f",
-                    position.exit_debit, position.realized_pnl,
+                    "[CONDOR] Exited (profit_target, resting order): debit=$%.2f/share, realized P&L=$%.2f (total incl. flatten: $%.2f)",
+                    position.exit_debit, position.realized_pnl, _total_realized_pnl(position),
                 )
-                _alerts.notify_exit("profit_target", position.exit_debit, position.realized_pnl,
+                _alerts.notify_exit("profit_target", position.exit_debit, _total_realized_pnl(position),
                                     position.entry_net_credit * position.multiplier * position.contracts)
                 return position
-            defend_forces_exit = defend_action == "close_reversal"
-            if now.time() >= backstop_time or defend_forces_exit or vix_recross_exit:
+            if now.time() >= backstop_time or vix_recross_exit:
                 executor.cancel_resting_exit(resting_order_id)
                 logger.warning(
                     "[CONDOR] %s -- cancelled resting profit-target order %s, switching to %s exit",
-                    "Defend reversal" if defend_forces_exit else ("VIX recrossed flat" if vix_recross_exit else "Backstop time reached"),
+                    "VIX recrossed flat" if vix_recross_exit else "Backstop time reached",
                     resting_order_id,
-                    "defend_reversal" if defend_forces_exit else ("vix_recross" if vix_recross_exit else "backstop"),
+                    "vix_recross" if vix_recross_exit else "backstop",
                 )
                 resting_order_id = None
                 # No `continue` -- fall straight into the exit-reason check
@@ -506,7 +525,6 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
                 continue
 
         reason = should_exit(position, current_debit, now, backstop_time) or \
-            ("defend_reversal" if defend_action == "close_reversal" else None) or \
             ("vix_recross" if vix_recross_exit else None)
         if not reason:
             await asyncio.sleep(MONITOR_POLL_SEC)
@@ -531,10 +549,10 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
 
         if position.status == "closed":
             logger.info(
-                "[CONDOR] Exited (%s): debit=$%.2f/share, realized P&L=$%.2f",
-                reason, position.exit_debit, position.realized_pnl,
+                "[CONDOR] Exited (%s): debit=$%.2f/share, realized P&L=$%.2f (total incl. flatten: $%.2f)",
+                reason, position.exit_debit, position.realized_pnl, _total_realized_pnl(position),
             )
-            _alerts.notify_exit(reason, position.exit_debit, position.realized_pnl,
+            _alerts.notify_exit(reason, position.exit_debit, _total_realized_pnl(position),
                                 position.entry_net_credit * position.multiplier * position.contracts)
             return position
 
@@ -562,13 +580,28 @@ async def run_day(options_chain, executor: CondorOrderExecutor, symbol: str = SY
 
 
 def hypothetical_net_pnl(position: CondorPosition, quotes) -> float:
-    """What the net P&L WOULD be right now if this (already-closed)
-    position were still open and closed at these quotes -- pure
-    hindsight data. Never mutates the position; position.realized_pnl
-    stays the one real, already-recorded result."""
+    """What the net P&L WOULD be right now if whatever's still open on
+    this position were closed at these quotes -- pure hindsight/mark
+    data, used both for live monitoring (_log_intraday_snapshot) and
+    post-close hindsight tracking. Never mutates the position;
+    position.realized_pnl stays the one real, already-recorded result.
+
+    Includes position.flatten_pnl (already banked, if one side has
+    been flattened) PLUS the mark on whatever's left open --
+    entry_net_credit/round_trip_fees/legs have already narrowed to just
+    that remaining side by this point (see CondorOrderExecutor._finalize_flatten),
+    so this adds, never double-counts, the flattened side's result."""
     debit = mid_debit_to_close(position, quotes)
     gross = (position.entry_net_credit - debit) * position.multiplier * position.contracts
-    return gross - position.round_trip_fees
+    open_side_pnl = gross - position.round_trip_fees
+    return open_side_pnl + (position.flatten_pnl or 0.0)
+
+
+def _total_realized_pnl(position: CondorPosition) -> float:
+    """The real, final day total once the position is fully closed:
+    whatever was banked by flattening (flatten_pnl, or 0 if that never
+    happened) plus the final close's own realized_pnl."""
+    return (position.realized_pnl or 0.0) + (position.flatten_pnl or 0.0)
 
 
 async def track_post_close(

@@ -47,7 +47,8 @@ from config import (
     ENTRY_CHASE_STEP, ENTRY_CHASE_SETTLE_TIMEOUT_SEC, ENTRY_CHASE_SETTLE_POLL_SEC,
     ENTRY_CHASE_MAX_WALK_TICKS, ENTRY_CHASE_ABORT_MISS_STREAK,
 )
-from iron_butterfly import IronButterflyResult, UntestedSideRoll, recompute_profit_target_debit
+from iron_butterfly import IronButterflyResult, recompute_profit_target_debit
+import fees as _fees
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +109,9 @@ class CondorPosition:
     entry_net_credit: float          # per share, AS FILLED (not the planning mid-based figure)
     max_loss: float                  # per share, GROSS, from the IronButterflyResult at entry time
     profit_target_debit: float       # per share, NET of real round-trip fees (fees.py) -- see iron_butterfly.py
-    target_pct: float                # CONDOR_PROFIT_TARGET_PCT at entry -- kept on the position so an
-                                      # untested-side roll can recompute profit_target_debit off the new,
-                                      # larger entry_net_credit (see _finalize_untested_roll)
+    target_pct: float                # CONDOR_PROFIT_TARGET_PCT at entry -- kept on the position so a
+                                      # flatten can recompute profit_target_debit off the remaining
+                                      # side's own, smaller entry_net_credit (see _finalize_flatten)
     round_trip_fees: float           # dollars, estimated at entry (fees.py; price-independent, contracts-based)
     entry_time: datetime
     entry_order_id: Optional[str] = None
@@ -118,24 +119,36 @@ class CondorPosition:
     exit_time: Optional[datetime] = None
     exit_debit: Optional[float] = None    # per share, AS FILLED
     exit_order_id: Optional[str] = None
-    exit_reason: Optional[str] = None     # "profit_target" | "backstop" | "manual" | "error" |
-                                           # "defend_reversal" | "vix_recross" | "roll_unavailable"
-                                           # ("roll_unavailable": daily_loop._attempt_untested_roll
-                                           # found no strike that both hit the roll's delta target
-                                           # and cleared the other side's open short strike --
-                                           # see iron_butterfly.select_untested_short's
-                                           # opposite_strike guard -- and force-closed the whole
-                                           # position rather than leave it unrolled and unwatched)
+    exit_reason: Optional[str] = None     # "profit_target" | "backstop" | "manual" | "error" | "vix_recross"
     gross_pnl: Optional[float] = None     # dollars, before fees
-    realized_pnl: Optional[float] = None  # dollars, NET of round_trip_fees -- the real economic result
-    rolled_side: Optional[str] = None     # "call" | "put" | None -- set once the untested side has
-                                           # been rolled (see submit_untested_roll); None means the
-                                           # position is still the original, as-entered structure
-    rolls_used: int = 0                   # how many untested-side rolls this position has had --
-                                           # compared against CONDOR_MAX_UNTESTED_ROLLS_PER_DAY
+    realized_pnl: Optional[float] = None  # dollars, NET of round_trip_fees -- the real economic result,
+                                           # for whatever is left open at the time of this final close
+                                           # (just the untested side's own credit if flattened_side is
+                                           # set -- see flatten_pnl for the OTHER side's already-banked result)
+    call_side_entry_credit: float = 0.0   # per share, planning-mid estimate at entry -- used only to
+    put_side_entry_credit: float = 0.0    # gate/size a flatten decision, not for final P&L booking
+    flattened_side: Optional[str] = None  # "call" | "put" | None -- set once that side has been
+                                           # closed on its own (see CondorOrderExecutor.close_vertical);
+                                           # None means both sides are still open as entered
+    flatten_time: Optional[datetime] = None
+    flatten_order_id: Optional[str] = None
+    flatten_debit: Optional[float] = None   # per share, AS FILLED, for the flattened side alone
+    flatten_pnl: Optional[float] = None      # dollars, NET of that side's own exit fees -- banked
+                                              # independently of whatever realized_pnl ends up being
+                                              # for the side left open
 
     @property
     def legs(self) -> List[CondorLegRecord]:
+        """All 4 legs, UNLESS one side has been flattened (see
+        close_vertical) -- then just the still-open side's short+wing,
+        in (short, wing) order. Every other function in this module
+        that iterates position.legs (mid_debit_to_close, submit_exit,
+        fetch_leg_quotes, ...) automatically narrows to just what's
+        still open once this changes, with no other code to touch."""
+        if self.flattened_side == "call":
+            return [self.short_put, self.long_put]
+        if self.flattened_side == "put":
+            return [self.short_call, self.long_call]
         return [self.short_call, self.short_put, self.long_call, self.long_put]
 
 
@@ -183,35 +196,29 @@ def build_exit_payload(position: CondorPosition, price: float, external_id: Opti
     }
 
 
-def _untested_roll_legs_payload(position: CondorPosition, roll: UntestedSideRoll) -> list:
-    old_short = position.short_call if roll.side == "call" else position.short_put
-    old_wing = position.long_call if roll.side == "call" else position.long_put
+def _vertical_close_legs_payload(position: CondorPosition, side: str) -> list:
+    short_leg = position.short_call if side == "call" else position.short_put
+    wing_leg = position.long_call if side == "call" else position.long_put
     return [
-        {"instrument-type": "Equity Option", "symbol": old_short.symbol,
-         "quantity": position.contracts, "action": "Buy to Close"},
-        {"instrument-type": "Equity Option", "symbol": old_wing.symbol,
-         "quantity": position.contracts, "action": "Sell to Close"},
-        {"instrument-type": "Equity Option", "symbol": roll.new_short.symbol,
-         "quantity": position.contracts, "action": "Sell to Open"},
-        {"instrument-type": "Equity Option", "symbol": roll.new_wing.symbol,
-         "quantity": position.contracts, "action": "Buy to Open"},
+        {"instrument-type": "Equity Option", "symbol": short_leg.symbol,
+         "quantity": position.contracts, "action": _REVERSE_ACTION[short_leg.entry_action]},
+        {"instrument-type": "Equity Option", "symbol": wing_leg.symbol,
+         "quantity": position.contracts, "action": _REVERSE_ACTION[wing_leg.entry_action]},
     ]
 
 
-def build_untested_roll_payload(position: CondorPosition, roll: UntestedSideRoll, price: float,
-                                 external_id: Optional[str] = None) -> dict:
-    """One 4-leg combo order: close the untested side's old short+wing,
-    open the new closer pair -- same single-ticket shape as entry/exit.
-    Priced as a credit since a roll closer to the money should always
-    collect more than it costs to unwind the old spread (build_untested_side_roll
-    already refuses to build a roll that wouldn't)."""
+def build_vertical_close_payload(position: CondorPosition, side: str, price: float,
+                                  external_id: Optional[str] = None) -> dict:
+    """One 2-leg combo order: close just `side`'s short+wing -- the
+    "flatten the untested side" defense (see CondorOrderExecutor.close_vertical),
+    same single-ticket shape as entry/exit but half the legs."""
     return {
         "time-in-force": "Day",
         "order-type": "Limit",
         "price": round(price, 2),
-        "price-effect": "Credit",
+        "price-effect": "Debit",
         "external-identifier": external_id or new_external_id(),
-        "legs": _untested_roll_legs_payload(position, roll),
+        "legs": _vertical_close_legs_payload(position, side),
     }
 
 
@@ -238,6 +245,13 @@ def _position_from_result(result: IronButterflyResult, net_credit: float, order_
         round_trip_fees=result.round_trip_fees,
         entry_time=datetime.now(),
         entry_order_id=order_id,
+        # NOT result.call_wing_width - result.call_side_max_loss / put_wing_width -
+        # put_side_max_loss -- those both just reduce back to the single COMBINED
+        # net_credit (build_iron_butterfly uses the same whole-structure net_credit
+        # for both sides' max-loss sizing, by design -- see its own math). The
+        # actual per-side split needs each side's own mid prices directly.
+        call_side_entry_credit=result.short_call.mid - result.long_call.mid,
+        put_side_entry_credit=result.short_put.mid - result.long_put.mid,
     )
 
 
@@ -459,92 +473,94 @@ class CondorOrderExecutor:
         lifecycle."""
         return self._cancel_order(order_id)
 
-    # --- defend: roll the untested side ------------------------------------
+    # --- defend: flatten the untested side ----------------------------------
 
-    def submit_untested_roll(self, position: CondorPosition, roll: UntestedSideRoll,
-                              old_quotes: Dict[str, Tuple[float, float]], *,
-                              dry_run: bool = False) -> OrderResult:
-        """Close the untested side's existing short+wing and open the new,
-        closer pair from build_untested_side_roll -- one 4-leg combo order
-        (2 closes + 2 opens). On a real fill, mutates `position` in place
-        (see _finalize_untested_roll): the rolled side's legs are replaced,
-        the roll's net credit is folded into entry_net_credit so every
-        downstream P&L figure (profit-target check, alerts, history) keeps
-        reading off the same field unchanged, and max_loss is recomputed
-        from the now-possibly-asymmetric wing widths. profit_target_debit
-        is also recomputed off the new, larger entry_net_credit (fixed
-        2026-11-04 -- previously it stayed at the ORIGINAL entry's
-        target_pct of the ORIGINAL, smaller credit, so it triggered the
-        profit-target exit earlier than CONDOR_PROFIT_TARGET_PCT of the
-        new total credit really intends; same root cause as the plain
-        entry-chase case recompute_profit_target_debit was pulled out for)."""
+    def close_vertical(self, position: CondorPosition, side: str,
+                        quotes: Dict[str, Tuple[float, float]], *,
+                        dry_run: bool = False) -> OrderResult:
+        """Close just `side`'s short+wing (2 legs) and leave the other
+        side open on its own -- replaces the old untested-side roll
+        (retired 2026-11-12, see config.py's CONDOR_DEFEND_ENABLED
+        comment for why: no safe room to roll closer once breakeven is
+        actually breached on a shared-strike butterfly). Caller decides
+        `side` (the UNTESTED one) and has already gated this on that
+        side having captured most of its own profit -- see
+        daily_loop.evaluate_defend/CONDOR_DEFEND_CAPTURE_PCT.
+
+        On a real fill, mutates `position` in place (_finalize_flatten):
+        banks this side's own P&L into flatten_pnl, and shrinks
+        entry_net_credit/max_loss/profit_target_debit/round_trip_fees
+        down to just the remaining side -- position.legs then also
+        narrows automatically, so every other function in this module
+        (mid_debit_to_close, submit_exit, fetch_leg_quotes, ...) keeps
+        working unchanged against whatever's actually still open."""
+        short_leg = position.short_call if side == "call" else position.short_put
+        wing_leg = position.long_call if side == "call" else position.long_put
+
         if not EXECUTE_ORDERS:
-            net_credit = self._simulate_untested_roll_fill(position, roll, old_quotes)
-            self._finalize_untested_roll(position, roll, net_credit, order_id=None)
+            short_bid, short_ask = quotes[short_leg.symbol]
+            wing_bid, wing_ask = quotes[wing_leg.symbol]
+            debit = short_ask - wing_bid   # buy back the short at ask, sell the wing at bid
+            self._finalize_flatten(position, side, debit, order_id=None)
             logger.info(
-                "[PAPER] Untested-side roll (%s) | new short=$%.2f new wing=$%.2f | "
-                "simulated net credit=$%.2f (planning mid=$%.2f)",
-                roll.side, roll.new_short_strike, roll.new_wing_strike, net_credit, roll.roll_credit,
+                "[PAPER] Flattened untested %s side | simulated debit=$%.2f/share | partial P&L=$%.2f",
+                side, debit, position.flatten_pnl,
             )
-            return OrderResult(status=OrderStatus.FILLED, net_price=net_credit,
+            return OrderResult(status=OrderStatus.FILLED, net_price=debit,
                                 filled_quantity=position.contracts,
-                                message=f"Paper roll fill ({roll.side})")
+                                message=f"Paper flatten fill ({side})")
 
-        planning_price = roll.roll_credit
-        payload = build_untested_roll_payload(position, roll, price=planning_price)
+        short_bid, short_ask = quotes[short_leg.symbol]
+        wing_bid, wing_ask = quotes[wing_leg.symbol]
+        planning_debit = (short_bid + short_ask) / 2.0 - (wing_bid + wing_ask) / 2.0
+        payload = build_vertical_close_payload(position, side, price=planning_debit)
         order_id = self._post_order(payload, dry_run=dry_run)
         if dry_run:
-            return OrderResult(status=OrderStatus.NOT_SUBMITTED, order_id=order_id, message="Dry-run roll accepted")
+            return OrderResult(status=OrderStatus.NOT_SUBMITTED, order_id=order_id, message="Dry-run flatten accepted")
         if order_id is None:
-            return OrderResult(status=OrderStatus.ERROR, message="Roll order submission failed")
+            return OrderResult(status=OrderStatus.ERROR, message="Flatten order submission failed")
 
-        status, net_price, filled_qty = self._poll_fill(order_id, position.contracts)
-        if status == OrderStatus.FILLED and net_price is not None:
-            self._finalize_untested_roll(position, roll, net_price, order_id=order_id)
-        return OrderResult(status=status, order_id=order_id, net_price=net_price, filled_quantity=filled_qty)
+        status, raw_net_price, filled_qty = self._poll_fill(order_id, position.contracts)
+        # Same sign-flip as submit_exit: Buy to Close (the short) comes back
+        # negative, Sell to Close (the wing) positive, in _extract_net_fill's
+        # direction-agnostic convention -- net of the two is the NEGATIVE of
+        # what this closing order actually cost.
+        debit = None if raw_net_price is None else -raw_net_price
+        if status == OrderStatus.FILLED and debit is not None:
+            self._finalize_flatten(position, side, debit, order_id=order_id)
+        return OrderResult(status=status, order_id=order_id, net_price=debit, filled_quantity=filled_qty)
 
-    def _simulate_untested_roll_fill(self, position: CondorPosition, roll: UntestedSideRoll,
-                                      old_quotes: Dict[str, Tuple[float, float]]) -> float:
-        """Realistic marketable fill, same convention as
-        _simulate_entry_fill/_simulate_exit_fill: buy back the old short at
-        ask, sell the old wing at bid (the cost to unwind), sell the new
-        short at bid, buy the new wing at ask (the new spread's proceeds)."""
-        old_short = position.short_call if roll.side == "call" else position.short_put
-        old_wing = position.long_call if roll.side == "call" else position.long_put
-        old_short_bid, old_short_ask = old_quotes[old_short.symbol]
-        old_wing_bid, old_wing_ask = old_quotes[old_wing.symbol]
-        close_cost = old_short_ask - old_wing_bid
-        open_credit = roll.new_short.bid - roll.new_wing.ask
-        return open_credit - close_cost
+    def _finalize_flatten(self, position: CondorPosition, side: str, debit: float,
+                           order_id: Optional[str]) -> None:
+        side_credit = position.call_side_entry_credit if side == "call" else position.put_side_entry_credit
+        flatten_fee = _fees.exit_fees(position.contracts, legs=2)
+        gross = (side_credit - debit) * position.multiplier * position.contracts
 
-    def _finalize_untested_roll(self, position: CondorPosition, roll: UntestedSideRoll,
-                                 net_credit: float, order_id: Optional[str]) -> None:
-        new_short_leg = CondorLegRecord(roll.new_short.symbol, roll.new_short.strike, "Sell to Open")
-        new_wing_leg = CondorLegRecord(roll.new_wing.symbol, roll.new_wing.strike, "Buy to Open")
-        if roll.side == "call":
-            position.short_call = new_short_leg
-            position.long_call = new_wing_leg
-        else:
-            position.short_put = new_short_leg
-            position.long_put = new_wing_leg
+        position.flattened_side = side
+        position.flatten_time = datetime.now()
+        position.flatten_order_id = order_id
+        position.flatten_debit = debit
+        position.flatten_pnl = gross - flatten_fee
 
-        position.entry_net_credit += net_credit
-        position.rolled_side = roll.side
-        position.rolls_used += 1
+        # Shrink everything else down to just the remaining side -- position.legs
+        # (read AFTER flattened_side is set, above) now returns [short, wing]
+        # for whichever side is still open.
+        remaining_credit = position.put_side_entry_credit if side == "call" else position.call_side_entry_credit
+        remaining_short, remaining_wing = position.legs
+        remaining_wing_width = abs(remaining_wing.strike - remaining_short.strike)
 
-        # Recompute max_loss from each side's OWN current short strike --
-        # after this roll, short_call.strike and short_put.strike may no
-        # longer match (it's effectively an iron condor now, not a
-        # butterfly, on whichever side rolled). Same formula build_iron_butterfly
-        # uses at entry, just evaluated off the live leg strikes.
-        call_wing_width = position.long_call.strike - position.short_call.strike
-        put_wing_width = position.short_put.strike - position.long_put.strike
-        call_side_max_loss = call_wing_width - position.entry_net_credit
-        put_side_max_loss = put_wing_width - position.entry_net_credit
-        position.max_loss = max(call_side_max_loss, put_side_max_loss)
-
+        position.entry_net_credit = remaining_credit
+        position.max_loss = remaining_wing_width - remaining_credit
+        # The entry commission (paid once, for all 4 legs, at entry) plus
+        # this side's own future exit fee -- NOT this flatten's exit fee,
+        # already charged above via flatten_fee. Total fees across the
+        # whole day end up exactly entry_fees(4) + exit_fees(2) [this
+        # flatten] + exit_fees(2) [the eventual final close] either way.
+        position.round_trip_fees = (
+            _fees.entry_fees(position.contracts, legs=4) + _fees.exit_fees(position.contracts, legs=2)
+        )
         position.profit_target_debit = recompute_profit_target_debit(
-            position.entry_net_credit, position.target_pct, position.multiplier,
+            remaining_credit, position.target_pct, position.multiplier,
             position.contracts, position.round_trip_fees,
         )
 
@@ -741,7 +757,17 @@ class CondorOrderExecutor:
                 return False
 
             if response.status_code in (200, 201):
+                # The 200/201 here only means the broker ACCEPTED the cancel
+                # request, not that the order is reflected as terminal in the
+                # account's order book yet -- found live 2026-11-10: a resting
+                # exit order was cancelled (this returned 200), and the very
+                # next order submitted ~230ms later to replace it was rejected
+                # with cannot_close_against_more_than_existing_position
+                # because the old order was still showing as an open closing
+                # order server-side. Poll until it's actually gone before
+                # telling the caller it's safe to submit a replacement.
                 logger.info("[ORDER] Cancelled open order %s", order_id)
+                self._confirm_cancelled(order_id)
                 return True
             if response.status_code in (400, 422):
                 logger.info("[ORDER] Cancel of %s returned %s (already terminal)", order_id, response.status_code)
@@ -759,6 +785,30 @@ class CondorOrderExecutor:
 
             logger.warning("[ORDER] Cancel of %s returned unexpected %s", order_id, response.status_code)
             return False
+
+    def _confirm_cancelled(self, order_id: str, timeout_sec: float = 3.0, poll_interval: float = 0.25) -> None:
+        """Block until `order_id` actually shows a terminal status, so a
+        caller that cancels one order and immediately submits a replacement
+        (the resting-exit cancel-then-resubmit path in daily_loop.py) never
+        races the broker's own eventual consistency -- see the 2026-11-10
+        incident noted in _cancel_order above. Best-effort: if it never
+        settles within timeout_sec, logs and returns anyway rather than
+        hanging the monitoring loop forever over a status check."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            status, _, _ = self._check_order_once(order_id)
+            if status in ("cancelled", "rejected", "expired"):
+                return
+            if status == "filled":
+                # Filled in the cancel race -- also terminal, nothing left
+                # to collide with a replacement order.
+                return
+            time.sleep(poll_interval)
+        logger.warning(
+            "[ORDER] %s did not show a terminal status within %.1fs of cancelling -- "
+            "proceeding anyway, a replacement order may still collide",
+            order_id, timeout_sec,
+        )
 
 
 def mid_debit_to_close(position: CondorPosition, quotes: Dict[str, Tuple[float, float]]) -> float:

@@ -64,17 +64,17 @@ def notify_exit(reason: str, exit_debit: float, realized_pnl: float,
     )
 
 
-def notify_roll(side: str, new_short_strike: float, new_wing_strike: float,
-                 roll_net_credit: float, total_net_credit: float) -> None:
+def notify_flatten(side: str, debit: float, flatten_pnl: float) -> None:
+    icon = "✅" if flatten_pnl > 0 else "❌" if flatten_pnl < 0 else "➖"
+    sign = "+" if flatten_pnl >= 0 else ""
     _post(
-        f"\U0001F504 *Rolled untested {side} side* closer for extra credit\n"
-        f"  New short ${new_short_strike:.2f} / wing ${new_wing_strike:.2f}  ·  "
-        f"Roll credit: ${roll_net_credit:.2f}/share  ·  Total net credit now: ${total_net_credit:.2f}/share"
+        f"{icon} *Flattened untested {side} side* · debit ${debit:.2f}/share\n"
+        f"  Banked P&L: *{sign}${flatten_pnl:.2f}*  ·  other side left open"
     )
 
 
-def notify_roll_failed(side: str, reason: str) -> None:
-    _post(f"⚠️ *Untested {side} side roll did not go through* · {reason}")
+def notify_flatten_failed(side: str, reason: str) -> None:
+    _post(f"⚠️ *Untested {side} side flatten did not go through* · {reason}")
 
 
 def notify_backstop_failure(attempts: int, last_price_override: float) -> None:

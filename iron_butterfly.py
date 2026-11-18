@@ -32,15 +32,12 @@ real round-trip fees at the resulting contract count, not gross alone.
 """
 import argparse
 import json
-import logging
 import math
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
 import fees as _fees
-
-_log = logging.getLogger(__name__)
 
 
 class IronButterflyError(ValueError):
@@ -315,119 +312,6 @@ def build_iron_butterfly(
         entry_fees=entry_fee_dollars, exit_fees=exit_fee_dollars, round_trip_fees=round_trip_fee_dollars,
         net_max_profit=net_max_profit, net_max_loss=net_max_loss, net_reward_to_risk=net_reward_to_risk,
         warnings=warnings,
-    )
-
-
-@dataclass
-class UntestedSideRoll:
-    """The new short+wing pair for rolling an open position's UNTESTED
-    side closer to the money -- see select_untested_short/
-    build_untested_side_roll."""
-    side: str                  # "call" or "put" -- the side being rolled
-    new_short: LegQuote
-    new_wing: LegQuote
-    new_short_strike: float
-    new_wing_strike: float
-    new_wing_width: float      # per share
-    roll_credit: float         # per share, GROSS, mid-based -- THIS NEW SPREAD'S
-                                # own planning credit only. Does NOT net out what it
-                                # costs to close the old spread being replaced -- the
-                                # caller combines this with a live quote on the old
-                                # legs to get the roll's real net cash flow.
-
-
-def select_untested_short(legs: List[LegQuote], side: str, current_price: float,
-                           target_delta: float = 0.30, *,
-                           opposite_strike: Optional[float] = None) -> LegQuote:
-    """Pick a NEW short strike for the untested side when rolling it
-    closer for extra credit (the tastytrade-style defense, not a
-    recenter of the whole structure). Same 'closest to target_delta
-    without going under' rule as select_wing. OTM is defined against
-    the CURRENT underlying price (call strikes above it, put strikes
-    below) -- AND, when `opposite_strike` is given, against the short
-    strike still open on the OTHER (tested) side, so a roll can never
-    cross the two spreads over each other. `opposite_strike` is the
-    tested side's own short strike (e.g. the still-open short put when
-    rolling the call side): the new call short must stay above it,
-    the new put short must stay below it -- not just OTM of spot,
-    which alone let a roll pick a strike inside the other spread when
-    price had already moved past it (see Nov 5 2026 incident: call
-    rolled to $743, UNDER the open $754 short put)."""
-    if side == "put":
-        floor = current_price if opposite_strike is None else min(current_price, opposite_strike)
-        candidates = [l for l in legs if l.strike < floor]
-    elif side == "call":
-        floor = current_price if opposite_strike is None else max(current_price, opposite_strike)
-        candidates = [l for l in legs if l.strike > floor]
-    else:
-        raise ValueError(f"side must be 'put' or 'call', got {side!r}")
-
-    candidates = [l for l in candidates if l.delta is not None]
-    if not candidates:
-        bound_desc = f"the current price (${current_price:.2f})"
-        if opposite_strike is not None:
-            bound_desc += f" and the open short {'call' if side == 'put' else 'put'} (${opposite_strike:.2f})"
-        raise IronButterflyError(
-            f"No {side} strikes {'below' if side == 'put' else 'above'} "
-            f"{bound_desc} with a usable delta."
-        )
-
-    at_or_above = [l for l in candidates if abs(l.delta) >= target_delta]
-    if not at_or_above:
-        closest_available = max(abs(l.delta) for l in candidates)
-        raise IronButterflyError(
-            f"No {side} strike has |delta| >= target {target_delta:.2f} "
-            f"(closest available is |delta|={closest_available:.3f}) -- "
-            f"refusing to roll to an under-targeted strike."
-        )
-    return min(at_or_above, key=lambda l: abs(l.delta) - target_delta)
-
-
-def build_untested_side_roll(
-    chain: ChainSnapshot, *, side: str,
-    short_target_delta: float = 0.30,
-    wing_target_delta: float = 0.10,
-    opposite_strike: Optional[float] = None,
-) -> UntestedSideRoll:
-    """Build a new, closer short+wing pair for the UNTESTED side of an
-    already-open iron butterfly/condor -- the tastytrade-style defense
-    of rolling the safe side in for more credit, rather than touching
-    the side that's actually losing. `side` is "call" or "put": the
-    side NOT being tested (the caller decides which, from the open
-    position's own breakeven math -- see daily_loop.evaluate_defend).
-    `opposite_strike` is the tested side's own still-open short strike
-    (pass position.short_put.strike when side="call", or
-    position.short_call.strike when side="put") -- it's forwarded to
-    select_untested_short as the hard floor/ceiling that keeps the
-    roll from crossing into the other spread.
-
-    The new short is picked off current OTM delta, bounded by both
-    the underlying price and `opposite_strike` (select_untested_short),
-    then given its own protective wing the same way entry does
-    (select_wing, reusing the same target-delta discipline -- never
-    under target, closest available at or above it)."""
-    legs = chain.calls if side == "call" else chain.puts
-    new_short = select_untested_short(legs, side, chain.underlying_price, short_target_delta,
-                                       opposite_strike=opposite_strike)
-    new_wing = select_wing(legs, new_short.strike, side, wing_target_delta)
-
-    for leg, label in ((new_short, "new short"), (new_wing, "new wing")):
-        if leg.bid is None or leg.ask is None:
-            raise IronButterflyError(f"{label} (strike ${leg.strike:.2f}) has no bid/ask quote.")
-
-    roll_credit = new_short.mid - new_wing.mid
-    new_wing_width = (new_wing.strike - new_short.strike) if side == "call" else (new_short.strike - new_wing.strike)
-
-    if roll_credit >= new_wing_width:
-        raise IronButterflyError(
-            f"Roll credit (${roll_credit:.2f}) >= new wing width (${new_wing_width:.2f}) -- "
-            f"would leave zero or negative max loss on the rolled side, refusing."
-        )
-
-    return UntestedSideRoll(
-        side=side, new_short=new_short, new_wing=new_wing,
-        new_short_strike=new_short.strike, new_wing_strike=new_wing.strike,
-        new_wing_width=new_wing_width, roll_credit=roll_credit,
     )
 
 

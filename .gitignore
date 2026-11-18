@@ -24,3 +24,4 @@ bot.lock
 Thumbs.db
 *.swp
 *.swo
+slack_bot_log.txt
